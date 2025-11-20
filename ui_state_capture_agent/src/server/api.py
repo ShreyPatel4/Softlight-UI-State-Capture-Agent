@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+import io
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from sqlalchemy.orm import Session
+
+from src.models import Flow, Step, get_db
+from src.storage.base import StorageBackend
+from src.storage.minio_store import get_storage
+
+BASE_DIR = Path(__file__).parent
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+templates = Jinja2Templates(directory=BASE_DIR / "templates")
+
+
+@app.get("/", response_class=HTMLResponse)
+def list_flows(request: Request, db: Session = Depends(get_db)) -> Any:
+    flows = db.query(Flow).order_by(Flow.started_at.desc()).limit(50).all()
+    return templates.TemplateResponse("flows_list.html", {"request": request, "flows": flows})
+
+
+@app.get("/flows/{flow_id}", response_class=HTMLResponse)
+def flow_detail(flow_id: UUID, request: Request, db: Session = Depends(get_db)) -> Any:
+    flow = db.query(Flow).filter(Flow.id == flow_id).first()
+    if flow is None:
+        raise HTTPException(status_code=404, detail="Flow not found")
+
+    steps = (
+        db.query(Step)
+        .filter(Step.flow_id == flow_id)
+        .order_by(Step.step_index.asc())
+        .all()
+    )
+
+    return templates.TemplateResponse(
+        "flow_detail.html", {"request": request, "flow": flow, "steps": steps}
+    )
+
+
+@app.get("/assets/{flow_id}/{step_index}/screenshot")
+def get_screenshot(
+    flow_id: UUID,
+    step_index: int,
+    db: Session = Depends(get_db),
+    storage: StorageBackend = Depends(get_storage),
+) -> StreamingResponse:
+    step = (
+        db.query(Step)
+        .filter(Step.flow_id == flow_id, Step.step_index == step_index)
+        .first()
+    )
+    if step is None:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+    image_bytes = storage.get_bytes(step.screenshot_key)
+    return StreamingResponse(io.BytesIO(image_bytes), media_type="image/png")

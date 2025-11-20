@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+    <header class="panel-header">
+        <div>
+            <p class="eyebrow">Flow</p>
+            <h2>{{ flow.task_title }}</h2>
+            <p class="muted">{{ flow.task_blurb }}</p>
+        </div>
+        <div class="flow-meta">
+            <div><span class="label">App</span><strong>{{ flow.app_name }}</strong></div>
+            <div><span class="label">Run ID</span><strong>{{ flow.run_id }}</strong></div>
+            <div><span class="label">Status</span><strong class="status status-{{ flow.status | lower }}">{{ flow.status }}</strong></div>
+            <div><span class="label">Started</span><strong>{{ flow.started_at }}</strong></div>
+        </div>
+    </header>
+</section>
+
+<section class="steps-grid">
+    {% for step in steps %}
+    <article class="step-card">
+        <div class="step-meta">
+            <div class="step-index">#{{ step.step_index }}</div>
+            <div>
+                <p class="eyebrow">{{ step.state_label }}</p>
+                <h3>{{ step.description }}</h3>
+                <p class="muted">{{ step.url }}</p>
+            </div>
+        </div>
+        <div class="step-image">
+            <img src="{{ url_for('get_screenshot', flow_id=flow.id, step_index=step.step_index) }}" alt="Step {{ step.step_index }} screenshot" loading="lazy">
+        </div>
+    </article>
+    {% else %}
+    <p class="empty">No steps recorded for this flow.</p>
+    {% endfor %}
+</section>
+{% endblock %}
