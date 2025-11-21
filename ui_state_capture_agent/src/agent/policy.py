@@ -1,78 +1,90 @@
 import json
-from typing import Dict, List
+from typing import List, Dict
 
-import openai
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
 from ..config import settings
-from .dom_scanner import CandidateAction
 from .task_spec import TaskSpec
+from .dom_scanner import CandidateAction
 
 
 class Policy:
+    """
+    LLM backed policy that chooses the next UI action using a Hugging Face model.
+    """
+
     def __init__(self) -> None:
-        openai.api_key = settings.openai_api_key
-        self.client = openai.AsyncOpenAI(api_key=openai.api_key)
-
-    @staticmethod
-    def _build_user_message(
-        task: TaskSpec, candidates: List[CandidateAction], history_summary: str
-    ) -> str:
-        lines: List[str] = [
-            "Task:",
-            f"- App: {task.app_name}",
-            f"- Goal: {task.goal}",
-            f"- Object type: {task.object_type}",
-            "",
-            "Recent history summary:",
-            history_summary or "(none)",
-            "",
-            "Candidate actions:",
-        ]
-
-        for idx, candidate in enumerate(candidates, start=1):
-            lines.append(f"{idx}. {candidate.id}: {candidate.description}")
-
-        lines.append(
-            "\nRespond with JSON in the following format:\n"
-            "{\n"
-            '  "chosen_action_id": "act_3",\n'
-            '  "action_type": "click",\n'
-            '  "input_text": null,\n'
-            '  "capture_before": true,\n'
-            '  "capture_after": true,\n'
-            '  "state_label_after": "create_modal_open",\n'
-            '  "done": false,\n'
-            '  "reason": "We need to open the create project modal."\n'
-            "}"
+        model_name = settings.hf_model_name
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.generator = pipeline(
+            "text-generation",
+            model=AutoModelForCausalLM.from_pretrained(model_name),
+            tokenizer=self.tokenizer,
+            max_new_tokens=384,
+            do_sample=False,
+            temperature=0.1,
         )
 
-        return "\n".join(lines)
+    def _build_prompt(
+        self,
+        task: TaskSpec,
+        candidates: List[CandidateAction],
+        history_summary: str,
+    ) -> str:
+        actions_text = "\n".join(
+            f"{idx + 1}. id={c.id} action_type={c.action_type} description={c.description}"
+            for idx, c in enumerate(candidates)
+        )
 
-    @staticmethod
-    def _fallback_action(candidates: List[CandidateAction]) -> Dict:
-        if not candidates:
-            return {
-                "chosen_action_id": None,
-                "action_type": None,
-                "input_text": None,
-                "capture_before": False,
-                "capture_after": False,
-                "state_label_after": None,
-                "done": False,
-                "reason": "No candidate actions available.",
-            }
+        prompt = f"""
+You are a UI agent controlling a web browser.
 
-        first_candidate = candidates[0]
-        return {
-            "chosen_action_id": first_candidate.id,
-            "action_type": first_candidate.action_type,
-            "input_text": None,
-            "capture_before": True,
-            "capture_after": True,
-            "state_label_after": None,
-            "done": False,
-            "reason": "Falling back to first candidate due to invalid or unparsable model response.",
-        }
+Your goal is to complete the user's task by choosing the next best UI action.
+
+Task:
+  app: {task.app_name}
+  goal: {task.goal}
+  object_type: {task.object_type}
+
+Recent history (previous steps):
+{history_summary or "none"}
+
+You have these candidate actions on the current page:
+{actions_text}
+
+Choose ONE best next action.
+
+Respond ONLY with valid JSON using this schema:
+
+{{
+  "chosen_action_id": "act_3",
+  "action_type": "click",
+  "input_text": null,
+  "capture_before": true,
+  "capture_after": true,
+  "state_label_after": "some_state_label",
+  "done": false,
+  "reason": "short explanation of your choice"
+}}
+
+Do NOT include any extra commentary outside the JSON.
+"""
+        return prompt.strip()
+
+    def _run_hf(self, prompt: str) -> str:
+        out = self.generator(
+            prompt,
+            num_return_sequences=1,
+        )[0]["generated_text"]
+        return out
+
+    def _extract_json(self, raw: str) -> Dict:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1:
+            raise ValueError("No JSON object found in model output")
+        json_str = raw[start : end + 1]
+        return json.loads(json_str)
 
     async def choose_action(
         self,
@@ -80,35 +92,41 @@ class Policy:
         candidates: List[CandidateAction],
         history_summary: str,
     ) -> Dict:
-        system_prompt = (
-            "You are a UI agent deciding which UI element to interact with next. "
-            "You must respond only with JSON."
-        )
-        user_message = self._build_user_message(task, candidates, history_summary)
+        """
+        Decide the next action. Called from the agent loop.
+        """
+        prompt = self._build_prompt(task, candidates, history_summary)
+        raw = self._run_hf(prompt)
 
         try:
-            completion = await self.client.chat.completions.create(
-                model=settings.openai_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-            )
-            content = completion.choices[0].message.content if completion.choices else None
-        except Exception:  # noqa: BLE001
-            return self._fallback_action(candidates)
+            data = self._extract_json(raw)
+        except Exception:
+            # Fallback to first candidate if parsing fails
+            first = candidates[0]
+            return {
+                "chosen_action_id": first.id,
+                "action_type": first.action_type,
+                "input_text": None,
+                "capture_before": True,
+                "capture_after": True,
+                "state_label_after": f"after_{first.id}",
+                "done": False,
+                "reason": "Fallback decision because model output was not valid JSON",
+            }
 
-        if not content:
-            return self._fallback_action(candidates)
+        # Validate chosen_action_id
+        valid_ids = {c.id for c in candidates}
+        if data.get("chosen_action_id") not in valid_ids:
+            first = candidates[0]
+            data["chosen_action_id"] = first.id
+            data["action_type"] = first.action_type
 
-        try:
-            result = json.loads(content)
-        except json.JSONDecodeError:
-            return self._fallback_action(candidates)
+        # Ensure required keys exist with sane defaults
+        data.setdefault("input_text", None)
+        data.setdefault("capture_before", True)
+        data.setdefault("capture_after", True)
+        data.setdefault("state_label_after", f"after_{data['chosen_action_id']}")
+        data.setdefault("done", False)
+        data.setdefault("reason", "Model did not provide a reason")
 
-        candidate_ids = {candidate.id for candidate in candidates}
-        if result.get("chosen_action_id") not in candidate_ids:
-            return self._fallback_action(candidates)
-
-        result.setdefault("done", False)
-        return result
+        return data
