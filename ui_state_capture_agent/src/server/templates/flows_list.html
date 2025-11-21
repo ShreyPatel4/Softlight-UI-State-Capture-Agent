@@ -2,6 +2,10 @@
 
 {% block content %}
 <section class="panel">
+    <form class="flow-run-form" method="post" action="/run_from_ui">
+        <input type="text" name="query" placeholder="Enter task query, e.g. 'linear: create project'" size="60" />
+        <button type="submit">Run Agent</button>
+    </form>
     <header class="panel-header">
         <h2>Recent Flows</h2>
         <p>Showing the 50 most recent runs.</p>

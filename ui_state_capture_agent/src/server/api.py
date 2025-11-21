@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any, List
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -69,6 +69,12 @@ async def run_agent_task(payload: RunTaskRequest):
         task_title=flow.task_title,
         status=flow.status,
     )
+
+
+@app.post("/run_from_ui")
+async def run_from_ui(query: str = Form(...)):
+    flow = await run_task_query_async(query)
+    return RedirectResponse(url=f"/flows/{flow.id}", status_code=303)
 
 
 @app.get("/", response_class=HTMLResponse)
