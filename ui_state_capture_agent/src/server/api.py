@@ -9,8 +9,10 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from src.agent.orchestrator import run_task_query_async
 from src.models import Flow, Step, get_db
 from src.storage.base import StorageBackend
 from src.storage.minio_store import get_storage
@@ -22,10 +24,54 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 
+class RunTaskRequest(BaseModel):
+    query: str
+
+
 @app.get("/", response_class=HTMLResponse)
 def list_flows(request: Request, db: Session = Depends(get_db)) -> Any:
     flows = db.query(Flow).order_by(Flow.started_at.desc()).limit(50).all()
     return templates.TemplateResponse("flows_list.html", {"request": request, "flows": flows})
+
+
+@app.post("/api/runs")
+async def start_run(payload: RunTaskRequest) -> dict[str, Any]:
+    try:
+        flow = await run_task_query_async(payload.query)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"flow_id": str(flow.id), "status": flow.status}
+
+
+@app.get("/api/flows/{flow_id}")
+def get_flow_status(flow_id: UUID, db: Session = Depends(get_db)) -> dict[str, Any]:
+    flow = db.query(Flow).filter(Flow.id == flow_id).first()
+    if flow is None:
+        raise HTTPException(status_code=404, detail="Flow not found")
+
+    steps = (
+        db.query(Step)
+        .filter(Step.flow_id == flow_id)
+        .order_by(Step.step_index.asc())
+        .all()
+    )
+
+    return {
+        "id": str(flow.id),
+        "status": flow.status,
+        "started_at": flow.started_at,
+        "finished_at": flow.finished_at,
+        "steps": [
+            {
+                "index": step.step_index,
+                "label": step.state_label,
+                "description": step.description,
+                "url": step.url,
+            }
+            for step in steps
+        ],
+    }
 
 
 @app.get("/flows/{flow_id}", response_class=HTMLResponse)
