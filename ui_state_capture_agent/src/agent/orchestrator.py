@@ -1,18 +1,11 @@
 import asyncio
-from typing import Final
 
 from ..models import SessionLocal, Flow
-from .task_spec import TaskSpec
+from .task_spec import TaskSpec, parse_task_query
 from .capture import CaptureManager
 from .policy import Policy
 from .agent_loop import run_agent_loop
 from ..storage.minio_store import get_storage
-
-APP_START_URLS: Final = {
-    "linear": "https://linear.app",
-    "notion": "https://www.notion.so",
-    "outlook": "https://outlook.office.com/mail/",
-}
 
 
 _run_lock: asyncio.Lock | None = None
@@ -42,11 +35,11 @@ def _get_run_lock() -> asyncio.Lock:
 async def run_task_query_async(raw_query: str) -> Flow:
     """Orchestrate a full agent run for a single natural language query."""
 
-    task = TaskSpec.from_query(raw_query)
-    if task.app_name not in APP_START_URLS:
-        raise ValueError(f"Unsupported app_name: {task.app_name}")
-
-    start_url = APP_START_URLS[task.app_name]
+    task = parse_task_query(raw_query)
+    print(
+        f"[orchestrator] Running task for app={task.app_name} "
+        f"start_url={task.start_url} goal={task.goal}"
+    )
 
     run_lock = _get_run_lock()
 
@@ -70,7 +63,7 @@ async def run_task_query_async(raw_query: str) -> Flow:
                 flow=flow,
                 capture_manager=capture_manager,
                 policy=policy,
-                start_url=start_url,
+                start_url=task.start_url,
                 max_steps=15,
             )
             db.refresh(flow)
