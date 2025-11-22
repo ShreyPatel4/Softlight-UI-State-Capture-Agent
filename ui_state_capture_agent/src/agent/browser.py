@@ -41,3 +41,6 @@ class BrowserSession:
         if not self.page:
             raise RuntimeError("Browser page is not initialized. Use within an async context manager.")
         return await self.page.content()
+
+    def __repr__(self) -> str:
+        return f"BrowserSession(headless={settings.headless})"

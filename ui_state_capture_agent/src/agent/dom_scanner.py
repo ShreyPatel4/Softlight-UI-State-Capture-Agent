@@ -29,19 +29,24 @@ async def scan_candidate_actions(page: Page, max_actions: int = 40) -> List[Cand
         return truncated_text, locator
 
     # Collect clickable button actions
-    button_locator = page.get_by_role("button")
+    button_locator = page.locator("button")
     button_count = await button_locator.count()
     for i in range(button_count):
         if len(actions) >= max_actions:
             return actions
         element = button_locator.nth(i)
-        text, locator = await build_text(element, f"button >> nth={i}")
-        description = f"Click button '{text}'" if text else "Click button"
+        if not await element.is_visible():
+            continue
+        locator_str = f"button >> nth={i}"
+        text = (await element.inner_text() or "").strip()
+        description = (
+            f"Click button '{text}'" if text else f"Click button index {i}"
+        )
         actions.append(
             CandidateAction(
-                id=f"act_{len(actions) + 1}",
+                id=f"btn_{i}",
                 action_type="click",
-                locator=locator,
+                locator=locator_str,
                 description=description,
             )
         )
@@ -53,6 +58,8 @@ async def scan_candidate_actions(page: Page, max_actions: int = 40) -> List[Cand
         if len(actions) >= max_actions:
             return actions
         element = link_locator.nth(i)
+        if not await element.is_visible():
+            continue
         text, locator = await build_text(element, f"a[href] >> nth={i}")
         description = f"Click link '{text}'" if text else "Click link"
         actions.append(
@@ -71,6 +78,8 @@ async def scan_candidate_actions(page: Page, max_actions: int = 40) -> List[Cand
         if len(actions) >= max_actions:
             return actions
         element = input_locator.nth(i)
+        if not await element.is_visible():
+            continue
         placeholder = await element.get_attribute("placeholder")
         placeholder_text = (placeholder or "").strip()
         truncated_placeholder = placeholder_text[:60]

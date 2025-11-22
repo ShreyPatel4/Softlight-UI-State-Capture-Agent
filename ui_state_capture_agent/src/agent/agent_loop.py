@@ -1,5 +1,7 @@
 from typing import Optional
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from .task_spec import TaskSpec
 from .dom_scanner import scan_candidate_actions
 from .policy import Policy
@@ -69,7 +71,30 @@ async def run_agent_loop(
             cand = next((c for c in candidates if c.id == decision.get("chosen_action_id")), candidates[0])
 
             if decision.get("action_type") == "click":
-                await page.locator(cand.locator).click()
+                locator = page.locator(cand.locator)
+
+                try:
+                    if not await locator.is_visible():
+                        print(
+                            f"[agent_loop] Skipping action {cand.id}: locator {cand.locator} is not visible"
+                        )
+                        continue
+                except PlaywrightTimeoutError:
+                    print(
+                        f"[agent_loop] Visibility check timed out for {cand.id} ({cand.locator}), skipping"
+                    )
+                    continue
+
+                try:
+                    await locator.click(timeout=2000)
+                except PlaywrightTimeoutError:
+                    print(
+                        f"[agent_loop] Click timed out for {cand.id} ({cand.locator}), skipping this action"
+                    )
+                    history_summary = (history_summary or "") + (
+                        f"\nAction {cand.id} with locator {cand.locator} failed (click timeout)."
+                    )
+                    continue
             elif decision.get("action_type") == "type":
                 await page.locator(cand.locator).fill(decision.get("input_text", ""))
 
