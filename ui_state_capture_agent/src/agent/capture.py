@@ -41,19 +41,16 @@ class CaptureManager:
 
     async def capture_step(
         self,
-        flow: Flow,
         page: Page,
+        flow: Flow,
         label: str,
         dom_html: str,
-        description: str | None = None,
-        diff_summary: Optional[str] = None,
-        diff_score: Optional[float] = None,
-<<<<<<< ours
-        action_description: str | None = None,
-=======
-        url_changed: Optional[bool] = None,
-        state_kind: Optional[str] = None,
->>>>>>> theirs
+        diff_summary: Optional[str],
+        diff_score: Optional[float],
+        action_description: Optional[str],
+        url_changed: bool,
+        state_kind: str,
+        description: Optional[str] = None,
         step_index: Optional[int] = None,
     ) -> Step:
         if step_index is None:

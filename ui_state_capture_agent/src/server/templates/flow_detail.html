@@ -30,14 +30,19 @@
             <div>
                 <p class="eyebrow">State: {{ step.state_label }}</p>
                 <h3>{{ step.description }}</h3>
-                <p class="muted">
-                    <span class="label">URL</span>
-                    {% if step.url %}
-                        {{ step.url }}
+                <div class="state-meta">
+                    {% if step.url_changed %}
+                        <span class="pill pill-url">URL change</span>
                     {% else %}
-                        Unchanged
+                        <span class="pill pill-dom">Same URL</span>
                     {% endif %}
-                </p>
+                    {% if step.state_kind %}
+                        <span class="pill pill-kind">{{ step.state_kind }}</span>
+                    {% endif %}
+                </div>
+                <div class="state-url">
+                    <code>{{ step.url }}</code>
+                </div>
             </div>
         </div>
         <div class="step-image">

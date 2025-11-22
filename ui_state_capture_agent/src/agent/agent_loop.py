@@ -48,14 +48,19 @@ async def run_agent_loop(
             return
 
         dom_html = await capture_manager.get_dom_snapshot(page)
+        prev_url = page.url
+        prev_dom = dom_html
+
         await capture_manager.capture_step(
             page=page,
             flow=flow,
             label="initial_state",
-            dom_html=dom_html,
+            dom_html=prev_dom,
             diff_summary=None,
             diff_score=None,
             action_description="initial page load",
+            url_changed=True,
+            state_kind="url_change",
         )
 
         candidates = await scan_candidate_actions(page, max_actions=60)
@@ -71,22 +76,8 @@ async def run_agent_loop(
         if page is None:
             return
 
-        dom_initial = await capture_manager.get_dom_snapshot(page)
-        await capture_manager.capture_step(
-            page=page,
-            flow=flow,
-            label="initial",
-            description="Initial state",
-            dom_html=dom_initial,
-            step_index=0,
-            state_kind="initial",
-            url_changed=False,
-        )
-
         if await _check_cancel_requested(session, flow):
             return
-
-        previous_url = page.url
 
         goal_reached = False
         low_diff_streak = 0
@@ -98,8 +89,6 @@ async def run_agent_loop(
 
             if await _check_cancel_requested(session, flow):
                 return
-
-            dom_before = await capture_manager.get_dom_snapshot(page)
 
             if step_index != 1:
                 candidates = await scan_candidate_actions(page, max_actions=60)
@@ -118,7 +107,10 @@ async def run_agent_loop(
                         flow=flow,
                         label=decision.get("state_label_after", "done"),
                         description=decision.get("reason", ""),
-                        dom_html=dom_before,
+                        dom_html=prev_dom,
+                        diff_summary=None,
+                        diff_score=None,
+                        action_description=decision.get("reason"),
                         url_changed=False,
                         state_kind="dom_change",
                         step_index=step_index,
@@ -133,7 +125,10 @@ async def run_agent_loop(
                     flow=flow,
                     label=decision.get("state_label_before") or f"before_{step_index}",
                     description=f"Before action: {decision.get('reason', '')}",
-                    dom_html=dom_before,
+                    dom_html=prev_dom,
+                    diff_summary=None,
+                    diff_score=None,
+                    action_description=decision.get("reason"),
                     url_changed=False,
                     state_kind="dom_change",
                     step_index=step_index,
@@ -171,10 +166,23 @@ async def run_agent_loop(
 
             await page.wait_for_timeout(1000)
 
-            dom_after = await capture_manager.get_dom_snapshot(page)
-            diff_summary, diff_score = compute_dom_diff(dom_before, dom_after)
-            url_changed = page.url != previous_url
-            state_kind = "url_change" if url_changed else "dom_change"
+            current_dom = await capture_manager.get_dom_snapshot(page)
+            diff_summary, diff_score = compute_dom_diff(prev_dom, current_dom)
+
+            current_url = page.url
+
+            url_changed = current_url != prev_url
+
+            dialog_appeared = bool(diff_summary and "modal" in diff_summary.lower())
+
+            if url_changed:
+                state_kind = "url_change"
+            elif dialog_appeared:
+                state_kind = "dom_change_modal"
+            elif diff_score is not None and diff_score > 0.08:
+                state_kind = "dom_change"
+            else:
+                state_kind = "minor_change"
 
             should_capture_after = bool(decision.get("capture_after"))
             if diff_score is not None and diff_score > 0.1:
@@ -184,11 +192,12 @@ async def run_agent_loop(
                 await capture_manager.capture_step(
                     page=page,
                     flow=flow,
-                    label=decision.get("state_label_after") or "state_changed",
+                    label=decision.get("state_label_after") or state_kind,
                     description=decision.get("reason", ""),
-                    dom_html=dom_after,
+                    dom_html=current_dom,
                     diff_summary=diff_summary,
                     diff_score=diff_score,
+                    action_description=decision.get("reason") or cand.description,
                     url_changed=url_changed,
                     state_kind=state_kind,
                     step_index=step_index,
@@ -199,7 +208,8 @@ async def run_agent_loop(
                 [line for line in [history_summary, summary_line] if line]
             )
 
-            previous_url = page.url
+            prev_url = current_url
+            prev_dom = current_dom
 
             if diff_score is None or diff_score < LOW_DIFF_THRESHOLD:
                 low_diff_streak += 1

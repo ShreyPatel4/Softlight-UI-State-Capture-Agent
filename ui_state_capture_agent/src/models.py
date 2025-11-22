@@ -45,7 +45,7 @@ class Step(Base):
     description: Mapped[str] = mapped_column(String, nullable=False)
     url: Mapped[str] = mapped_column(String, nullable=False)
     url_changed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
-    state_kind: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    state_kind: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     screenshot_key: Mapped[str] = mapped_column(String, nullable=False)
     dom_key: Mapped[str] = mapped_column(String, nullable=False)
     diff_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
