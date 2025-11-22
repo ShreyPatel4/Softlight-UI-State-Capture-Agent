@@ -100,17 +100,17 @@ async def run_agent_loop(
             print(f"[agent_loop] history_summary length={len(history_summary or '')}")
             decision = await policy.choose_action(task, candidates, history_summary)
 
-            if decision.get("done"):
-                if decision.get("capture_after"):
+            if decision.done:
+                if decision.capture_after:
                     await capture_manager.capture_step(
                         page=page,
                         flow=flow,
-                        label=decision.get("state_label_after", "done"),
-                        description=decision.get("reason", ""),
+                        label=decision.label or "done",
+                        description=decision.reason or "",
                         dom_html=prev_dom,
                         diff_summary=None,
                         diff_score=None,
-                        action_description=decision.get("reason"),
+                        action_description=decision.reason,
                         url_changed=False,
                         state_kind="dom_change",
                         step_index=step_index,
@@ -119,26 +119,26 @@ async def run_agent_loop(
                 goal_reached = True
                 break
 
-            if decision.get("capture_before"):
+            if decision.capture_before:
                 await capture_manager.capture_step(
                     page=page,
                     flow=flow,
-                    label=decision.get("state_label_before") or f"before_{step_index}",
-                    description=f"Before action: {decision.get('reason', '')}",
+                    label=(decision.label and f"before_{decision.label}")
+                    or f"before_{step_index}",
+                    description=f"Before action: {decision.reason or ''}",
                     dom_html=prev_dom,
                     diff_summary=None,
                     diff_score=None,
-                    action_description=decision.get("reason"),
+                    action_description=decision.reason,
                     url_changed=False,
                     state_kind="dom_change",
                     step_index=step_index,
                 )
 
-            cand = next((c for c in candidates if c.id == decision.get("chosen_action_id")), candidates[0])
+            cand = next((c for c in candidates if c.id == decision.action_id), candidates[0])
 
-            if decision.get("action_type") == "click":
-                locator = page.locator(cand.locator)
-
+            locator = page.locator(cand.locator)
+            if decision.action_type == "click":
                 try:
                     if not await locator.is_visible():
                         print(
@@ -161,8 +161,10 @@ async def run_agent_loop(
                         f"\nAction {cand.id} with locator {cand.locator} failed (click timeout)."
                     )
                     continue
-            elif decision.get("action_type") == "type":
-                await page.locator(cand.locator).fill(decision.get("input_text", ""))
+            elif decision.action_type == "type":
+                if decision.text is None:
+                    raise ValueError("type action selected without text")
+                await locator.fill(decision.text)
 
             await page.wait_for_timeout(1000)
 
@@ -184,7 +186,7 @@ async def run_agent_loop(
             else:
                 state_kind = "minor_change"
 
-            should_capture_after = bool(decision.get("capture_after"))
+            should_capture_after = bool(decision.capture_after)
             if diff_score is not None and diff_score > 0.1:
                 should_capture_after = True
 
@@ -192,18 +194,18 @@ async def run_agent_loop(
                 await capture_manager.capture_step(
                     page=page,
                     flow=flow,
-                    label=decision.get("state_label_after") or state_kind,
-                    description=decision.get("reason", ""),
+                    label=decision.label or state_kind,
+                    description=decision.reason or "",
                     dom_html=current_dom,
                     diff_summary=diff_summary,
                     diff_score=diff_score,
-                    action_description=decision.get("reason") or cand.description,
+                    action_description=decision.reason or cand.description,
                     url_changed=url_changed,
                     state_kind=state_kind,
                     step_index=step_index,
                 )
 
-            summary_line = f"{step_index}. {decision.get('reason', '')}".strip()
+            summary_line = f"{step_index}. {decision.reason or ''}".strip()
             history_summary = "\n".join(
                 [line for line in [history_summary, summary_line] if line]
             )

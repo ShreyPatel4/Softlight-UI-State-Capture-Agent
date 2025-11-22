@@ -1,11 +1,24 @@
 import json
-from typing import Dict, List
+from dataclasses import dataclass
+from typing import Dict, List, Literal
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
 from ..config import settings
 from .task_spec import TaskSpec
 from .dom_scanner import CandidateAction
+
+
+@dataclass
+class PolicyDecision:
+    action_id: str
+    action_type: Literal["click", "type"]
+    text: str | None
+    done: bool
+    capture_before: bool
+    capture_after: bool
+    label: str | None
+    reason: str | None
 
 
 def _extract_first_json_object(text: str) -> str | None:
@@ -76,12 +89,12 @@ Choose ONE best next action.
 Respond ONLY with valid JSON using this schema:
 
 {{
-  "chosen_action_id": "act_3",
-  "action_type": "click",
-  "input_text": null,
+  "action_id": "act_3",
+  "action_type": "click" | "type",
+  "text": "text to type when action_type is type",
   "capture_before": true,
   "capture_after": true,
-  "state_label_after": "some_state_label",
+  "label": "state label after action",
   "done": false,
   "reason": "short explanation of your choice"
 }}
@@ -111,7 +124,7 @@ Do NOT include any extra commentary outside the JSON.
         task: TaskSpec,
         candidates: List[CandidateAction],
         history_summary: str,
-    ) -> Dict:
+    ) -> PolicyDecision:
         """
         Decide the next action. Called from the agent loop.
         """
@@ -122,31 +135,42 @@ Do NOT include any extra commentary outside the JSON.
             data = self._extract_json(raw)
         except ValueError:
             fallback = choose_fallback_action(task.goal, candidates)
-            return {
-                "chosen_action_id": fallback.id,
-                "action_type": fallback.action_type,
-                "input_text": None,
-                "capture_before": True,
-                "capture_after": True,
-                "state_label_after": f"after_{fallback.id}",
-                "done": False,
-                "reason": "Fallback decision because model output was not valid JSON",
-            }
+            return PolicyDecision(
+                action_id=fallback.id,
+                action_type=fallback.action_type,
+                text=None,
+                done=False,
+                capture_before=True,
+                capture_after=True,
+                label=f"after_{fallback.id}",
+                reason="Fallback decision because model output was not valid JSON",
+            )
 
-        # Validate chosen_action_id
+        # Validate action_id
         valid_ids = {c.id for c in candidates}
-        if data.get("chosen_action_id") not in valid_ids:
+        if data.get("action_id") not in valid_ids:
             first = candidates[0]
-            data["chosen_action_id"] = first.id
+            data["action_id"] = first.id
             data["action_type"] = first.action_type
 
         # Ensure required keys exist with sane defaults
-        data.setdefault("input_text", None)
+        data.setdefault("text", None)
         data.setdefault("capture_before", True)
         data.setdefault("capture_after", True)
-        data.setdefault("state_label_after", f"after_{data['chosen_action_id']}")
+        data.setdefault("label", f"after_{data['action_id']}")
         data.setdefault("done", False)
         data.setdefault("reason", "Model did not provide a reason")
+
+        decision = PolicyDecision(
+            action_id=data.get("action_id"),
+            action_type=data.get("action_type", "click"),
+            text=data.get("text"),
+            done=bool(data.get("done")),
+            capture_before=bool(data.get("capture_before")),
+            capture_after=bool(data.get("capture_after")),
+            label=data.get("label"),
+            reason=data.get("reason"),
+        )
 
         print(
             "[policy] decision:",
@@ -154,15 +178,15 @@ Do NOT include any extra commentary outside the JSON.
                 {
                     "app": task.app_name,
                     "goal": task.goal,
-                    "chosen_action_id": data.get("chosen_action_id"),
-                    "action_type": data.get("action_type"),
-                    "capture_before": data.get("capture_before"),
-                    "capture_after": data.get("capture_after"),
-                    "state_label_after": data.get("state_label_after"),
-                    "done": data.get("done"),
+                    "action_id": decision.action_id,
+                    "action_type": decision.action_type,
+                    "capture_before": decision.capture_before,
+                    "capture_after": decision.capture_after,
+                    "label": decision.label,
+                    "done": decision.done,
                 },
                 ensure_ascii=False,
             ),
         )
 
-        return data
+        return decision

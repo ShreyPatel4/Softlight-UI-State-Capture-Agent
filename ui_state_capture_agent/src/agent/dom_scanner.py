@@ -67,4 +67,26 @@ async def scan_candidate_actions(page: Page, max_actions: int = 60) -> List[Cand
             )
         )
 
+    # Text inputs and textareas for typing actions
+    input_locator = page.locator("input, textarea")
+    input_count = await input_locator.count()
+    for i in range(input_count):
+        if len(candidates) >= max_actions:
+            return candidates
+        handle = input_locator.nth(i)
+        if not await handle.is_visible():
+            continue
+        placeholder = await handle.get_attribute("placeholder")
+        ph = (placeholder or "").strip()
+        locator_str = f"input, textarea >> nth={i}"
+        desc = f"input with placeholder '{ph}'" if ph else "input/textarea"
+        candidates.append(
+            CandidateAction(
+                id=f"input_{i}",
+                locator=locator_str,
+                action_type="type",
+                description=desc,
+            )
+        )
+
     return candidates
