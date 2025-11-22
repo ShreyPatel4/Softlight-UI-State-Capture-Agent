@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, List
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -72,15 +72,32 @@ async def run_agent_task(payload: RunTaskRequest):
 
 
 @app.post("/run_from_ui")
-async def run_from_ui(query: str = Form(...)):
-    flow = await run_task_query_async(query)
+async def run_from_ui(
+    request: Request, query: str = Form(...), db: Session = Depends(get_db)
+):
+    try:
+        flow = await run_task_query_async(query)
+    except Exception as exc:  # noqa: BLE001
+        flows = db.query(Flow).order_by(Flow.started_at.desc()).limit(50).all()
+        return templates.TemplateResponse(
+            "flows_list.html",
+            {
+                "request": request,
+                "flows": flows,
+                "error_message": "Could not start run: " + str(exc),
+            },
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
     return RedirectResponse(url=f"/flows/{flow.id}", status_code=303)
 
 
 @app.get("/", response_class=HTMLResponse)
 def list_flows(request: Request, db: Session = Depends(get_db)) -> Any:
     flows = db.query(Flow).order_by(Flow.started_at.desc()).limit(50).all()
-    return templates.TemplateResponse("flows_list.html", {"request": request, "flows": flows})
+    return templates.TemplateResponse(
+        "flows_list.html", {"request": request, "flows": flows}
+    )
 
 
 @app.get("/api/flows", response_model=List[FlowSummary])

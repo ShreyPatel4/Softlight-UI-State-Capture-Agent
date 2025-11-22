@@ -23,9 +23,16 @@
         <div class="step-meta">
             <div class="step-index">#{{ step.step_index }}</div>
             <div>
-                <p class="eyebrow">{{ step.state_label }}</p>
+                <p class="eyebrow">State: {{ step.state_label }}</p>
                 <h3>{{ step.description }}</h3>
-                <p class="muted">{{ step.url }}</p>
+                <p class="muted">
+                    <span class="label">URL</span>
+                    {% if step.url %}
+                        {{ step.url }}
+                    {% else %}
+                        Unchanged
+                    {% endif %}
+                </p>
             </div>
         </div>
         <div class="step-image">

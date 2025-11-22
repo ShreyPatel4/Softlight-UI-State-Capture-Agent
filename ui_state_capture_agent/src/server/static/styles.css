@@ -131,6 +131,21 @@ table tr:hover {
     font-weight: 600;
 }
 
+.alert {
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin: 12px 0 0;
+    font-weight: 600;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border);
+}
+
+.alert.error {
+    color: #fecdd3;
+    border-color: rgba(248, 113, 113, 0.35);
+    background: rgba(248, 113, 113, 0.08);
+}
+
 .eyebrow {
     text-transform: uppercase;
     font-size: 12px;

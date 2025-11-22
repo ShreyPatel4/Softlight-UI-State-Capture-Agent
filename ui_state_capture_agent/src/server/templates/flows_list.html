@@ -6,6 +6,9 @@
         <input type="text" name="query" placeholder="Enter task query, e.g. 'linear: create project'" size="60" />
         <button type="submit">Run Agent</button>
     </form>
+    {% if error_message %}
+    <div class="alert error">{{ error_message }}</div>
+    {% endif %}
     <header class="panel-header">
         <h2>Recent Flows</h2>
         <p>Showing the 50 most recent runs.</p>
@@ -16,6 +19,7 @@
                 <tr>
                     <th>App</th>
                     <th>Task</th>
+                    <th>Goal</th>
                     <th>Run ID</th>
                     <th>Status</th>
                     <th>Started</th>
@@ -27,6 +31,7 @@
                 <tr>
                     <td>{{ flow.app_name }}</td>
                     <td>{{ flow.task_title }}</td>
+                    <td>{{ flow.task_blurb }}</td>
                     <td>{{ flow.run_id }}</td>
                     <td><span class="status status-{{ flow.status | lower }}">{{ flow.status }}</span></td>
                     <td>{{ flow.started_at }}</td>
