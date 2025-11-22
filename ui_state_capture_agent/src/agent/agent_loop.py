@@ -34,10 +34,12 @@ async def run_agent_loop(
             dom_diff = diff_dom(prev_dom, current_dom)  # noqa: F841
 
             candidates = await scan_candidate_actions(page)
+            print(f"[agent_loop] URL={page.url} candidates={len(candidates)}")
             if not candidates:
                 capture_manager.finish_flow(flow, status="no_actions")
                 break
 
+            print(f"[agent_loop] history_summary length={len(history_summary or '')}")
             decision = await policy.choose_action(task, candidates, history_summary)
 
             if decision.get("done"):

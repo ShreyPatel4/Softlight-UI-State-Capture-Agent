@@ -129,4 +129,21 @@ Do NOT include any extra commentary outside the JSON.
         data.setdefault("done", False)
         data.setdefault("reason", "Model did not provide a reason")
 
+        print(
+            "[policy] decision:",
+            json.dumps(
+                {
+                    "app": task.app_name,
+                    "goal": task.goal,
+                    "chosen_action_id": data.get("chosen_action_id"),
+                    "action_type": data.get("action_type"),
+                    "capture_before": data.get("capture_before"),
+                    "capture_after": data.get("capture_after"),
+                    "state_label_after": data.get("state_label_after"),
+                    "done": data.get("done"),
+                },
+                ensure_ascii=False,
+            ),
+        )
+
         return data
