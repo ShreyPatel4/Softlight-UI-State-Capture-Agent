@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from .task_spec import TaskSpec
 from .dom_scanner import scan_candidate_actions
-from .policy import Policy
+from .policy import PolicyLLMClient, choose_action_with_llm
 from .browser import BrowserSession
 from .capture import CaptureManager
 from ..models import Flow, log_flow_event
@@ -36,10 +36,11 @@ async def run_agent_loop(
     task: TaskSpec,
     flow: Flow,
     capture_manager: CaptureManager,
-    policy: Policy,
+    hf_pipeline,
     start_url: str,
 ) -> None:
     session = capture_manager.db_session
+    llm_client = PolicyLLMClient(hf_pipeline)
     async with BrowserSession() as browser:
         await browser.goto(start_url)
 
@@ -100,8 +101,18 @@ async def run_agent_loop(
                 break
 
             print(f"[agent_loop] history_summary length={len(history_summary or '')}")
-            decision = await policy.choose_action(
-                task, candidates, history_summary, page.url
+            current_url = page.url
+            decision = choose_action_with_llm(
+                llm_client,
+                task,
+                task.app_name,
+                current_url,
+                history_summary,
+                candidates,
+            )
+
+            selected_candidate = next(
+                c for c in candidates if c.id == decision.action_id
             )
 
             if decision.done:
@@ -150,19 +161,17 @@ async def run_agent_loop(
 
                 captured = True
 
-            cand = next((c for c in candidates if c.id == decision.action_id), candidates[0])
-
-            locator = page.locator(cand.locator)
+            locator = page.locator(selected_candidate.locator)
             if decision.action_type == "click":
                 try:
                     if not await locator.is_visible():
                         print(
-                            f"[agent_loop] Skipping action {cand.id}: locator {cand.locator} is not visible"
+                            f"[agent_loop] Skipping action {selected_candidate.id}: locator {selected_candidate.locator} is not visible"
                         )
                         continue
                 except PlaywrightTimeoutError:
                     print(
-                        f"[agent_loop] Visibility check timed out for {cand.id} ({cand.locator}), skipping"
+                        f"[agent_loop] Visibility check timed out for {selected_candidate.id} ({selected_candidate.locator}), skipping"
                     )
                     continue
 
@@ -170,10 +179,10 @@ async def run_agent_loop(
                     await locator.click(timeout=2000)
                 except PlaywrightTimeoutError:
                     print(
-                        f"[agent_loop] Click timed out for {cand.id} ({cand.locator}), skipping this action"
+                        f"[agent_loop] Click timed out for {selected_candidate.id} ({selected_candidate.locator}), skipping this action"
                     )
                     history_summary = (history_summary or "") + (
-                        f"\nAction {cand.id} with locator {cand.locator} failed (click timeout)."
+                        f"\nAction {selected_candidate.id} with locator {selected_candidate.locator} failed (click timeout)."
                     )
                     continue
             elif decision.action_type == "type":
@@ -214,7 +223,8 @@ async def run_agent_loop(
                     dom_html=current_dom,
                     diff_summary=diff_summary,
                     diff_score=diff_score,
-                    action_description=decision.reason or cand.description,
+                    action_description=decision.reason
+                    or selected_candidate.description,
                     url_changed=url_changed,
                     state_kind=state_kind,
                     step_index=step_index,
@@ -235,7 +245,7 @@ async def run_agent_loop(
                 session,
                 flow,
                 "INFO",
-                f"step={step_index} url={current_url} action='{cand.description}' diff={diff_str} captured={captured}",
+                f"step={step_index} url={current_url} action='{selected_candidate.description}' diff={diff_str} captured={captured}",
             )
 
             if diff_score is None or diff_score < LOW_DIFF_THRESHOLD:

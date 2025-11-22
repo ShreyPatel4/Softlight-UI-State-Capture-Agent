@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass
-from typing import Literal, Optional, Sequence
+from typing import Any, Literal, Optional, Sequence
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
@@ -134,6 +134,105 @@ def choose_fallback_action(
     return max(candidates, key=score)
 
 
+def create_policy_hf_pipeline(model_name: str | None = None) -> Any:
+    model_name = model_name or settings.hf_model_name
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+
+    return pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        device="cpu",
+        max_new_tokens=128,
+        do_sample=False,
+    )
+
+
+class PolicyLLMClient:
+    def __init__(self, hf_pipeline: Any) -> None:
+        self.hf_pipeline = hf_pipeline
+
+    def generate(self, prompt: str) -> str:
+        return self.hf_pipeline(prompt, num_return_sequences=1)[0]["generated_text"]
+
+
+def choose_action_with_llm(
+    llm_client: PolicyLLMClient,
+    task: TaskSpec,
+    app_name: str,
+    url: str,
+    history_summary: str,
+    candidates: Sequence[CandidateAction],
+) -> PolicyDecision:
+    prompt = build_policy_prompt(
+        task=task,
+        app_name=app_name,
+        url=url,
+        history_summary=history_summary,
+        candidates=candidates,
+    )
+    raw = llm_client.generate(prompt)
+
+    try:
+        data = _extract_json(raw)
+    except ValueError:
+        fallback = choose_fallback_action(task.goal, candidates)
+        return PolicyDecision(
+            action_id=fallback.id,
+            action_type=fallback.action_type,
+            text=None,
+            done=False,
+            capture_before=True,
+            capture_after=True,
+            label=f"after_{fallback.id}",
+            reason="Fallback decision because model output was not valid JSON",
+        )
+
+    valid_ids = {c.id for c in candidates}
+    if data.get("action_id") not in valid_ids:
+        first = candidates[0]
+        data["action_id"] = first.id
+        data["action_type"] = first.action_type
+
+    data.setdefault("text", None)
+    data.setdefault("capture_before", True)
+    data.setdefault("capture_after", True)
+    data.setdefault("label", f"after_{data['action_id']}")
+    data.setdefault("done", False)
+    data.setdefault("reason", "Model did not provide a reason")
+
+    decision = PolicyDecision(
+        action_id=data.get("action_id"),
+        action_type=data.get("action_type", "click"),
+        text=data.get("text"),
+        done=bool(data.get("done")),
+        capture_before=bool(data.get("capture_before")),
+        capture_after=bool(data.get("capture_after")),
+        label=data.get("label"),
+        reason=data.get("reason"),
+    )
+
+    print(
+        "[policy] decision:",
+        json.dumps(
+            {
+                "app": task.app_name,
+                "goal": task.goal,
+                "action_id": decision.action_id,
+                "action_type": decision.action_type,
+                "capture_before": decision.capture_before,
+                "capture_after": decision.capture_after,
+                "label": decision.label,
+                "done": decision.done,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    return decision
+
+
 class Policy:
     """
     LLM backed policy that chooses the next UI action using a Hugging Face model.
@@ -142,16 +241,7 @@ class Policy:
     def __init__(self, model_name: str | None = None) -> None:
         model_name = model_name or settings.hf_model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(model_name)
-
-        self.generator = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=self.tokenizer,
-            device="cpu",
-            max_new_tokens=128,
-            do_sample=False,
-        )
+        self.generator = create_policy_hf_pipeline(model_name)
 
     def _run_hf(self, prompt: str) -> str:
         out = self.generator(

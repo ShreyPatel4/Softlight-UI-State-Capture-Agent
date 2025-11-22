@@ -3,7 +3,7 @@ import asyncio
 from ..models import Flow, SessionLocal, log_flow_event
 from .task_spec import TaskSpec, parse_task_query
 from .capture import CaptureManager
-from .policy import Policy
+from .policy import create_policy_hf_pipeline
 from .agent_loop import run_agent_loop
 from ..storage.minio_store import get_storage
 
@@ -63,13 +63,13 @@ async def run_task_query_async(raw_query: str) -> Flow:
                 f"Flow started app={task.app_name} start_url={task.start_url} goal={task.goal}",
             )
 
-            policy = Policy()
+            hf_pipeline = create_policy_hf_pipeline()
 
             await run_agent_loop(
                 task=task,
                 flow=flow,
                 capture_manager=capture_manager,
-                policy=policy,
+                hf_pipeline=hf_pipeline,
                 start_url=task.start_url,
             )
             db.refresh(flow)
