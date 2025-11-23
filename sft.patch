@@ -1,0 +1,154 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/ui_state_capture_agent/scripts/run_task.py b/ui_state_capture_agent/scripts/run_task.py
+index 7b2f89858a911e1cdaa492f5ee6f48538625544f..38e97e0ae9e0a6356bc627f9fc170ea06efd3caf 100644
+--- a/ui_state_capture_agent/scripts/run_task.py
++++ b/ui_state_capture_agent/scripts/run_task.py
+@@ -1,15 +1,20 @@
+ import argparse
+-from src.agent.orchestrator import run_task_query_blocking
++from src.agent.orchestrator import FlowSummary, run_task_query_blocking
+ 
+ 
+ def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--query", required=True, help="Natural language task query for Agent B")
+     args = parser.parse_args()
+ 
+-    flow = run_task_query_blocking(args.query)
+-    print(f"Flow finished: id={flow.id} app={flow.app_name} run_id={flow.run_id} status={flow.status}")
++    summary: FlowSummary = run_task_query_blocking(args.query)
++
++    title_part = f" title={summary.task_title!r}" if summary.task_title else ""
++    print(
++        f"Flow finished: id={summary.id} app={summary.app_name} "
++        f"run_id={summary.run_id} status={summary.status}{title_part}"
++    )
+ 
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/ui_state_capture_agent/src/agent/orchestrator.py b/ui_state_capture_agent/src/agent/orchestrator.py
+index 0c62682a6d774c55c742d73eb64cc28895b3ab9c..dc9b6209cfcf85659b1fd4afe07096f116a8f50b 100644
+--- a/ui_state_capture_agent/src/agent/orchestrator.py
++++ b/ui_state_capture_agent/src/agent/orchestrator.py
+@@ -1,60 +1,71 @@
+ import asyncio
++from dataclasses import dataclass
++from typing import Optional
+ 
+ from ..models import Flow, SessionLocal, log_flow_event
+ from .task_spec import TaskSpec, parse_task_query
+ from .capture import CaptureManager
+ from .policy import create_policy_hf_pipeline
+ from .agent_loop import run_agent_loop
+ from ..storage.minio_store import get_storage
+ 
+ 
+ _run_lock: asyncio.Lock | None = None
+ _run_lock_loop: asyncio.AbstractEventLoop | None = None
+ 
+ 
++@dataclass
++class FlowSummary:
++    id: str
++    app_name: str
++    run_id: str
++    status: str
++    task_title: Optional[str] = None
++
++
+ def _get_run_lock() -> asyncio.Lock:
+     """Ensure only one agent run executes per event loop.
+ 
+     Playwright does not always behave well when multiple browser sessions are
+     created concurrently in the same process. A module-level asyncio.Lock keeps
+     requests serialized so that FastAPI only runs one long-lived agent at a
+     time. The lock is recreated if a new event loop is used (e.g., when calling
+     from the CLI via asyncio.run).
+     """
+ 
+     global _run_lock, _run_lock_loop
+ 
+     loop = asyncio.get_running_loop()
+     if _run_lock is None or _run_lock_loop is not loop:
+         _run_lock = asyncio.Lock()
+         _run_lock_loop = loop
+ 
+     return _run_lock
+ 
+ 
+-async def run_task_query_async(raw_query: str) -> Flow:
++async def run_task_query_async(raw_query: str) -> FlowSummary:
+     """Orchestrate a full agent run for a single natural language query."""
+ 
+     task = parse_task_query(raw_query)
+     print(
+         f"[orchestrator] Running task for app={task.app_name} "
+         f"start_url={task.start_url} goal={task.goal}"
+     )
+ 
+     run_lock = _get_run_lock()
+ 
+     async with run_lock:
+         db = SessionLocal()
+         try:
+             storage = get_storage()
+             capture_manager = CaptureManager(db_session=db, storage=storage)
+ 
+             flow = capture_manager.start_flow(
+                 app_name=task.app_name,
+                 task_id=task.object_type or "generic_task",
+                 task_title=task.goal,
+                 task_blurb=f"Auto run for query: {raw_query}",
+             )
+ 
+             log_flow_event(
+                 db,
+@@ -65,34 +76,42 @@ async def run_task_query_async(raw_query: str) -> Flow:
+ 
+             if not task.known_app:
+                 log_flow_event(
+                     db,
+                     flow,
+                     "warning",
+                     "Unknown app requested; using generic resolver",
+                 )
+ 
+             hf_pipeline = create_policy_hf_pipeline()
+ 
+             await run_agent_loop(
+                 task=task,
+                 flow=flow,
+                 capture_manager=capture_manager,
+                 hf_pipeline=hf_pipeline,
+                 start_url=task.start_url,
+             )
+             db.refresh(flow)
+             log_flow_event(
+                 db,
+                 flow,
+                 "INFO",
+                 f"Flow ended status={flow.status} reason={flow.status_reason or ''}",
+             )
+-            return flow
++            summary = FlowSummary(
++                id=str(flow.id),
++                app_name=flow.app_name,
++                run_id=flow.run_id,
++                status=flow.status,
++                task_title=getattr(flow, "task_title", None),
++            )
++
++            return summary
+         finally:
+             db.close()
+ 
+ 
+-def run_task_query_blocking(raw_query: str) -> Flow:
++def run_task_query_blocking(raw_query: str) -> FlowSummary:
+     """Synchronous wrapper for CLI usage."""
+ 
+     return asyncio.run(run_task_query_async(raw_query))
+ 
+EOF
+)

@@ -1,4 +1,6 @@
 import asyncio
+from dataclasses import dataclass
+from typing import Optional
 
 from ..models import Flow, SessionLocal, log_flow_event
 from .task_spec import TaskSpec, parse_task_query
@@ -10,6 +12,15 @@ from ..storage.minio_store import get_storage
 
 _run_lock: asyncio.Lock | None = None
 _run_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+@dataclass
+class FlowSummary:
+    id: str
+    app_name: str
+    run_id: str
+    status: str
+    task_title: Optional[str] = None
 
 
 def _get_run_lock() -> asyncio.Lock:
@@ -32,7 +43,7 @@ def _get_run_lock() -> asyncio.Lock:
     return _run_lock
 
 
-async def run_task_query_async(raw_query: str) -> Flow:
+async def run_task_query_async(raw_query: str) -> FlowSummary:
     """Orchestrate a full agent run for a single natural language query."""
 
     task = parse_task_query(raw_query)
@@ -87,12 +98,20 @@ async def run_task_query_async(raw_query: str) -> Flow:
                 "INFO",
                 f"Flow ended status={flow.status} reason={flow.status_reason or ''}",
             )
-            return flow
+            summary = FlowSummary(
+                id=str(flow.id),
+                app_name=flow.app_name,
+                run_id=flow.run_id,
+                status=flow.status,
+                task_title=getattr(flow, "task_title", None),
+            )
+
+            return summary
         finally:
             db.close()
 
 
-def run_task_query_blocking(raw_query: str) -> Flow:
+def run_task_query_blocking(raw_query: str) -> FlowSummary:
     """Synchronous wrapper for CLI usage."""
 
     return asyncio.run(run_task_query_async(raw_query))
