@@ -69,8 +69,16 @@ async def scan_candidate_actions(page: Page, max_actions: int = 60) -> List[Cand
             )
         )
 
-    # Text inputs and textareas for typing actions
-    input_locator = page.locator("input, textarea")
+    # Text inputs, textareas, and editable regions for typing actions
+    input_locator = page.locator(
+        "input:not([type]), "
+        "input[type='text'], "
+        "input[type='search'], "
+        "input[type='email'], "
+        "input[type='password'], "
+        "textarea, "
+        "[contenteditable='true'], [contenteditable='']"
+    )
     input_count = await input_locator.count()
     for i in range(input_count):
         if len(candidates) >= max_actions:
@@ -78,11 +86,25 @@ async def scan_candidate_actions(page: Page, max_actions: int = 60) -> List[Cand
         handle = input_locator.nth(i)
         if not await handle.is_visible():
             continue
-        placeholder = await handle.get_attribute("placeholder")
-        ph = (placeholder or "").strip()
-        locator_str = f"input, textarea >> nth={i}"
-        desc = (
-            f"input placeholder \"{ph}\"" if ph else "input/textarea"
+        placeholder = (await handle.get_attribute("placeholder") or "").strip()
+        aria_label = (await handle.get_attribute("aria-label") or "").strip()
+        name_attr = (await handle.get_attribute("name") or "").strip()
+        data_label = (await handle.get_attribute("data-placeholder") or "").strip()
+        inner_text = (await handle.inner_text() or "").strip()
+
+        descriptor = next(
+            (
+                value
+                for value in [placeholder, aria_label, data_label, name_attr, inner_text]
+                if value
+            ),
+            "",
+        )
+        desc = f"text input: {descriptor}" if descriptor else "text input"
+        locator_str = (
+            "input:not([type]), input[type='text'], input[type='search'], "
+            "input[type='email'], input[type='password'], textarea, [contenteditable='true'], [contenteditable=''] >> nth="
+            f"{i}"
         )
         candidates.append(
             CandidateAction(

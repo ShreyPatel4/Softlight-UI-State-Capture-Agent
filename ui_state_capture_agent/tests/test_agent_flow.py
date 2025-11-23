@@ -138,7 +138,7 @@ def make_decision(action_id: str, text: str | None = None) -> PolicyDecision:
     return PolicyDecision(
         action_id=action_id,
         action_type="click" if text is None else "type",
-        text=text,
+        input_text=text,
         done=False,
         capture_before=False,
         capture_after=True,
@@ -253,7 +253,17 @@ def test_steps_record_url_and_state(monkeypatch):
 
     decisions = [
         make_decision("url_change"),
-        PolicyDecision("url_change2", "click", None, True, False, True, "done", "finish", True),
+        PolicyDecision(
+            action_id="url_change2",
+            action_type="click",
+            input_text=None,
+            done=True,
+            capture_before=False,
+            capture_after=True,
+            label="done",
+            reason="finish",
+            should_capture=True,
+        ),
     ]
 
     async def fake_scan(_page, max_actions=40):
@@ -292,7 +302,19 @@ def test_done_without_change_marks_uncertain(monkeypatch):
     page = FakePage()
     browser = FakeBrowserSession(page)
 
-    decisions = [PolicyDecision("no_change", "click", None, True, False, True, "done", "finish", True)]
+    decisions = [
+        PolicyDecision(
+            action_id="no_change",
+            action_type="click",
+            input_text=None,
+            done=True,
+            capture_before=False,
+            capture_after=True,
+            label="done",
+            reason="finish",
+            should_capture=True,
+        )
+    ]
 
     async def fake_scan(_page, max_actions=40):
         return [CandidateAction(id="no_change", action_type="click", locator="no_change", description="noop")]
@@ -326,7 +348,19 @@ def test_capture_goal_can_finish_after_initial(monkeypatch):
     page = FakePage()
     browser = FakeBrowserSession(page)
 
-    decisions = [PolicyDecision("no_change", "click", None, True, False, True, "capture_done", "capture", True)]
+    decisions = [
+        PolicyDecision(
+            action_id="no_change",
+            action_type="click",
+            input_text=None,
+            done=True,
+            capture_before=False,
+            capture_after=True,
+            label="capture_done",
+            reason="capture",
+            should_capture=True,
+        )
+    ]
 
     async def fake_scan(_page, max_actions=40):
         return [CandidateAction(id="no_change", action_type="click", locator="no_change", description="noop")]
@@ -360,7 +394,19 @@ def test_llm_fallback_still_captures(monkeypatch):
     page = FakePage()
     browser = FakeBrowserSession(page)
 
-    decisions = [PolicyDecision(None, "click", None, True, False, True, "fallback", "bad json", True)]
+    decisions = [
+        PolicyDecision(
+            action_id=None,
+            action_type="click",
+            input_text=None,
+            done=True,
+            capture_before=False,
+            capture_after=True,
+            label="fallback",
+            reason="bad json",
+            should_capture=True,
+        )
+    ]
 
     async def fake_scan(_page, max_actions=40):
         return [CandidateAction(id="url_change", action_type="click", locator="url_change", description="button change")]

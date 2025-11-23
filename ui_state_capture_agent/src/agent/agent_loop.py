@@ -48,7 +48,6 @@ async def _maybe_capture_state(
     last_captured_dom: str | None,
     last_captured_url: str | None,
     diff_threshold: float,
-    step_index: int | None,
     force: bool = False,
 ):
     url_changed, diff_summary, diff_score, state_kind, changed = summarize_state_change(
@@ -69,7 +68,6 @@ async def _maybe_capture_state(
         action_description=description,
         url_changed=url_changed,
         state_kind=state_kind,
-        step_index=step_index,
     )
     return step, current_dom, page.url, changed, state_kind, diff_score
 
@@ -178,7 +176,6 @@ async def run_agent_loop(
                         last_captured_dom,
                         last_captured_url,
                         diff_threshold,
-                        step_index,
                         force=True,
                     )
                 flow.status = "finished"
@@ -204,7 +201,6 @@ async def run_agent_loop(
                     last_captured_dom,
                     last_captured_url,
                     diff_threshold,
-                    step_index,
                 )
                 if step:
                     log_flow_event(
@@ -222,10 +218,19 @@ async def run_agent_loop(
                         continue
                     await locator.click(timeout=2000)
                 elif decision.action_type == "type":
-                    if decision.text is None:
+                    if not await locator.is_visible():
                         failure_counts[_candidate_key(selected_candidate)] += 1
                         continue
-                    await locator.fill(decision.text)
+                    if not decision.input_text:
+                        log_flow_event(
+                            session,
+                            flow,
+                            "warning",
+                            "LLM did not provide input_text for type action; skipping",
+                        )
+                        failure_counts[_candidate_key(selected_candidate)] += 1
+                        continue
+                    await locator.fill(decision.input_text)
             except PlaywrightTimeoutError:
                 key = _candidate_key(selected_candidate)
                 failure_counts[key] += 1
@@ -263,7 +268,6 @@ async def run_agent_loop(
                 last_captured_dom,
                 last_captured_url,
                 diff_threshold,
-                step_index,
                 force=should_force_capture,
             )
             if step:

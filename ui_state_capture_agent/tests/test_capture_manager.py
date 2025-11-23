@@ -1,12 +1,19 @@
 import sys
 import asyncio
+import asyncio
 from types import SimpleNamespace
 
 from src.agent.capture import CaptureManager
+from src.models import Step
 
 
 class DummySession:
+    def __init__(self):
+        self.steps = []
+
     def query(self, *_args, **_kwargs):
+        session = self
+
         class Q:
             def filter(self, *_):
                 return self
@@ -15,11 +22,16 @@ class DummySession:
                 return self
 
             def first(self):
-                return None
+                if not session.steps:
+                    return None
+                max_index = max(step.step_index for step in session.steps)
+                return (max_index,)
 
         return Q()
 
-    def add(self, *_args, **_kwargs):
+    def add(self, obj, *_args, **_kwargs):
+        if isinstance(obj, Step):
+            self.steps.append(obj)
         return None
 
     def commit(self):
@@ -30,7 +42,11 @@ class DummySession:
 
 
 class DummyStorage:
-    def save_bytes(self, *_args, **_kwargs):
+    def __init__(self):
+        self.saved_keys = []
+
+    def save_bytes(self, key, *_args, **_kwargs):
+        self.saved_keys.append(key)
         return None
 
 
@@ -64,3 +80,43 @@ def test_capture_step_accepts_state_kind_and_url_changed():
     assert step.state_label == "test_state"
     assert step.url_changed is True
     assert step.state_kind == "dom_change"
+
+
+def test_capture_step_increments_indices_and_keys():
+    storage = DummyStorage()
+    session = DummySession()
+    capture_manager = CaptureManager(session, storage)
+    flow = SimpleNamespace(id="flow1", prefix="pref")
+
+    first_step = asyncio.run(
+        capture_manager.capture_step(
+            page=DummyPage(),
+            flow=flow,
+            label="first",
+            dom_html="<html></html>",
+            diff_summary=None,
+            diff_score=None,
+            action_description="",
+            url_changed=True,
+            state_kind="dom_change",
+        )
+    )
+
+    second_step = asyncio.run(
+        capture_manager.capture_step(
+            page=DummyPage(),
+            flow=flow,
+            label="second",
+            dom_html="<html></html>",
+            diff_summary=None,
+            diff_score=None,
+            action_description="",
+            url_changed=False,
+            state_kind="dom_change",
+        )
+    )
+
+    assert first_step.step_index == 1
+    assert second_step.step_index == 2
+    assert first_step.screenshot_key != second_step.screenshot_key
+    assert len(storage.saved_keys) == 4

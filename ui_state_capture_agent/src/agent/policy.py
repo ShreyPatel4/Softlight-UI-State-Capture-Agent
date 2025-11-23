@@ -22,34 +22,36 @@ def _extract_json(text: str) -> dict | None:
     returned. None is returned when parsing fails.
     """
 
-    def _strip_code_fences(payload: str) -> str:
-        fenced = re.findall(r"```(?:json)?\s*(.*?)```", payload, re.DOTALL | re.IGNORECASE)
-        if fenced:
-            return fenced[-1]
-        return payload
+    try:
+        def _strip_code_fences(payload: str) -> str:
+            fenced = re.findall(r"```(?:json)?\s*(.*?)```", payload, re.DOTALL | re.IGNORECASE)
+            if fenced:
+                return fenced[-1]
+            return payload
 
-    cleaned = _strip_code_fences(text.strip())
+        cleaned = _strip_code_fences(text.strip())
 
-    # Find all balanced JSON-looking spans
-    spans: list[str] = []
-    depth = 0
-    start_idx: int | None = None
-    for idx, ch in enumerate(cleaned):
-        if ch == "{":
-            if depth == 0:
-                start_idx = idx
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start_idx is not None:
-                    spans.append(cleaned[start_idx : idx + 1])
+        spans: list[str] = []
+        depth = 0
+        start_idx: int | None = None
+        for idx, ch in enumerate(cleaned):
+            if ch == "{":
+                if depth == 0:
+                    start_idx = idx
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start_idx is not None:
+                        spans.append(cleaned[start_idx : idx + 1])
 
-    for candidate in reversed(spans):
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
+        for candidate in reversed(spans):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        return None
 
     return None
 
@@ -58,7 +60,7 @@ def _extract_json(text: str) -> dict | None:
 class PolicyDecision:
     action_id: Optional[str]
     action_type: Literal["click", "type"]
-    text: Optional[str]
+    input_text: Optional[str]
     done: bool
     capture_before: bool
     capture_after: bool
@@ -68,60 +70,27 @@ class PolicyDecision:
 
 
 POLICY_SYSTEM_PROMPT = """
-You are a UI navigation agent inside a multi agent system.
+Return only a single JSON object that follows this schema:
+{
+  "action_id": "<one of the provided candidate ids>",
+  "action_type": "click" | "type",
+  "input_text": "<text to type>" | null,
+  "done": true | false,
+  "capture_before": true | false,
+  "capture_after": true | false,
+  "label": "<short snake_case label>",
+  "reason": "<brief reason>"
+}
 
-You do not see raw HTML. You only see:
-  • The user goal for this run.
-  • The current app name.
-  • The current page URL.
-  • A short natural language summary of what has already happened.
-  • A list of candidate actions extracted from the DOM.
+Rules:
+- Choose exactly one of the provided candidates and never invent ids.
+- When selecting a type action, set input_text to the text that advances the goal.
+- For creation or confirmation steps, keep done=false until the action would complete the goal.
+- Always emit JSON only; no prose, no markdown, no code fences.
 
-Each candidate action has:
-  • id: an identifier such as "btn_0", "link_3", "input_2".
-  • action_type: either "click" or "type".
-  • description: a short human description such as "button with text 'Create issue'" or "input with placeholder 'Title'".
-
-Your job is to pick the single best next action to move toward the goal.
-
-Very important:
-  • You must always choose exactly one of the provided candidates. Never invent new ids.
-  • If the goal requires typing text (for example "create issue named Softlight test"), choose a candidate with action_type "type" and provide the text field.
-  • If the goal requires clicking navigation or confirmation controls, choose a candidate with action_type "click".
-  • You should think step by step about the goal and what state we are currently in before choosing.
-
-Captures and state labels:
-  • The engine has already captured the initial page after navigation, so you do not need to handle the very first screenshot.
-  • Use capture_before=true when this action will show an interesting "before" state, for example before opening a modal or before submitting a form.
-  • Use capture_after=true when the action is likely to visibly change the UI, for example:
-      • opening a modal or dropdown
-      • moving to a different page or tab
-      • applying a filter or creating a new entity
-  • Set label to a short snake_case description of the state after the action, for example:
-      • "issue_form_open"
-      • "issue_created"
-      • "pricing_page_open"
-
-Done flag:
-  • Only set done=true AFTER the action you choose would leave the UI in the completed state.
-  • For creation or mutation goals (create issue/project/item, submit/save, enable/disable), expect that a visible modal or DOM change will be captured after the action. Keep done=false until that capture should happen.
-  • For simple viewing goals ("open the pricing page and capture one screenshot"), done=true is acceptable once the correct page is visible and captured.
-  • Otherwise, set done=false and the engine will call you again with an updated history.
-
-Output requirements:
-  • You must return exactly one JSON object.
-  • The JSON must match this schema exactly:
-       {
-         "action_id": "<one of the candidate ids>",
-         "action_type": "click" or "type",
-         "text": null or "<text to type>",
-         "done": true or false,
-         "capture_before": true or false,
-         "capture_after": true or false,
-         "label": null or "<short_snake_case_state_label>",
-         "reason": "<short natural language reason>"
-       }
-  • Return only JSON. Do not include any explanation outside of the JSON object.
+Example outputs for a Linear goal "create issue named 'Softlight agent test issue'" (choose one action at a time):
+{"action_id":"btn_0","action_type":"click","input_text":null,"done":false,"capture_before":true,"capture_after":true,"label":"open_issue_form","reason":"open the issue creation form"}
+{"action_id":"input_1","action_type":"type","input_text":"Softlight agent test issue","done":false,"capture_before":false,"capture_after":true,"label":"issue_title_entered","reason":"type the requested issue title"}
 """
 
 
@@ -183,6 +152,8 @@ def create_policy_hf_pipeline(model_name: str | None = None) -> Any:
         device="cpu",
         max_new_tokens=128,
         do_sample=False,
+        temperature=0.0,
+        top_p=0.9,
     )
 
 
@@ -221,7 +192,7 @@ def choose_action_with_llm(
         return PolicyDecision(
             action_id=None,
             action_type="click",
-            text=None,
+            input_text=None,
             done=True,
             capture_before=False,
             capture_after=True,
@@ -237,7 +208,7 @@ def choose_action_with_llm(
         return PolicyDecision(
             action_id=None,
             action_type="click",
-            text=None,
+            input_text=None,
             done=True,
             capture_before=False,
             capture_after=True,
@@ -252,7 +223,7 @@ def choose_action_with_llm(
     return PolicyDecision(
         action_id=action_id,
         action_type=action_type,
-        text=data.get("text"),
+        input_text=data.get("input_text") or data.get("text"),
         done=bool(data.get("done", False)),
         capture_before=bool(data.get("capture_before", True)),
         capture_after=bool(data.get("capture_after", True)),
@@ -309,7 +280,7 @@ class Policy:
             return PolicyDecision(
                 action_id=None,
                 action_type=fallback.action_type,
-                text=None,
+                input_text=None,
                 done=True,
                 capture_before=False,
                 capture_after=True,
@@ -326,7 +297,7 @@ class Policy:
             data["action_type"] = first.action_type
 
         # Ensure required keys exist with sane defaults
-        data.setdefault("text", None)
+        data.setdefault("input_text", data.get("text"))
         data.setdefault("capture_before", True)
         data.setdefault("capture_after", True)
         data.setdefault("label", f"after_action_{data['action_id']}")
@@ -336,7 +307,7 @@ class Policy:
         decision = PolicyDecision(
             action_id=data.get("action_id"),
             action_type=data.get("action_type", "click"),
-            text=data.get("text"),
+            input_text=data.get("input_text"),
             done=bool(data.get("done")),
             capture_before=bool(data.get("capture_before")),
             capture_after=bool(data.get("capture_after")),

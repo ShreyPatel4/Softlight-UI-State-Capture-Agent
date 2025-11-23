@@ -1,6 +1,9 @@
 import uuid
 
 from src.agent.dom_scanner import CandidateAction
+import uuid
+
+from src.agent.dom_scanner import CandidateAction
 from src.agent.policy import PolicyDecision, _extract_json, choose_action_with_llm
 from src.agent.task_spec import TaskSpec
 from src.models import FlowLog
@@ -58,6 +61,7 @@ def test_choose_action_valid_json():
     assert isinstance(decision, PolicyDecision)
     assert decision.action_id == "btn_0"
     assert decision.label == "after_action_btn_0"
+    assert decision.input_text is None
 
 
 def test_choose_action_fallback_logs_warning():

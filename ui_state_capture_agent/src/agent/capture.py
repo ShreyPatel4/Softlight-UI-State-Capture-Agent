@@ -16,6 +16,15 @@ class CaptureManager:
         self.db_session = db_session
         self.storage = storage
 
+    def _next_step_index(self, flow: Flow) -> int:
+        latest_index = (
+            self.db_session.query(Step.step_index)
+            .filter(Step.flow_id == flow.id)
+            .order_by(Step.step_index.desc())
+            .first()
+        )
+        return (latest_index[0] if latest_index else 0) + 1
+
     async def get_dom_snapshot(self, page: Page) -> str:
         return await page.content()
 
@@ -52,16 +61,8 @@ class CaptureManager:
         url_changed: bool,
         state_kind: str,
         description: Optional[str] = None,
-        step_index: Optional[int] = None,
     ) -> Step:
-        if step_index is None:
-            latest_index = (
-                self.db_session.query(Step.step_index)
-                .filter(Step.flow_id == flow.id)
-                .order_by(Step.step_index.desc())
-                .first()
-            )
-            step_index = (latest_index[0] if latest_index else 0) + 1
+        step_index = self._next_step_index(flow)
 
         screenshot_key = f"{flow.prefix}/step_{step_index}_screenshot.png"
         dom_key = f"{flow.prefix}/step_{step_index}_dom.html"
