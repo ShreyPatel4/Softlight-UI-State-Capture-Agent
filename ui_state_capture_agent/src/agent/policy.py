@@ -60,7 +60,7 @@ def _extract_json(text: str) -> dict | None:
 class PolicyDecision:
     action_id: Optional[str]
     action_type: Literal["click", "type"]
-    input_text: Optional[str]
+    text_to_type: Optional[str]
     done: bool
     capture_before: bool
     capture_after: bool
@@ -74,7 +74,7 @@ Return only a single JSON object that follows this schema:
 {
   "action_id": "<one of the provided candidate ids>",
   "action_type": "click" | "type",
-  "input_text": "<text to type>" | null,
+  "text_to_type": "<text to type>" | null,
   "done": true | false,
   "capture_before": true | false,
   "capture_after": true | false,
@@ -83,14 +83,18 @@ Return only a single JSON object that follows this schema:
 }
 
 Rules:
+- You will receive generic candidate actions. Some have "action_type": "click" and others have "action_type": "type".
 - Choose exactly one of the provided candidates and never invent ids.
-- When selecting a type action, set input_text to the text that advances the goal.
+- For click actions, ignore text_to_type or set it to null.
+- For type actions, set text_to_type to the exact text that should be typed based on the user goal.
+- Map goal parts to appropriate fields: names/titles/subjects go to inputs mentioning title, name, or subject; descriptions/details/comments go to inputs mentioning description, details, notes, or comment.
 - For creation or confirmation steps, keep done=false until the action would complete the goal.
+- If no action is needed or progress cannot be made, set action_id to null and text_to_type to null.
 - Always emit JSON only; no prose, no markdown, no code fences.
 
-Example outputs for a Linear goal "create issue named 'Softlight agent test issue'" (choose one action at a time):
-{"action_id":"btn_0","action_type":"click","input_text":null,"done":false,"capture_before":true,"capture_after":true,"label":"open_issue_form","reason":"open the issue creation form"}
-{"action_id":"input_1","action_type":"type","input_text":"Softlight agent test issue","done":false,"capture_before":false,"capture_after":true,"label":"issue_title_entered","reason":"type the requested issue title"}
+Example outputs for a generic goal "create item named 'Softlight agent test issue'":
+{"action_id":"btn_0","action_type":"click","text_to_type":null,"done":false,"capture_before":true,"capture_after":true,"label":"open_form","reason":"open the creation form"}
+{"action_id":"input_1","action_type":"type","text_to_type":"Softlight agent test issue","done":false,"capture_before":false,"capture_after":true,"label":"title_entered","reason":"type the requested title"}
 """
 
 
@@ -192,7 +196,7 @@ def choose_action_with_llm(
         return PolicyDecision(
             action_id=None,
             action_type="click",
-            input_text=None,
+            text_to_type=None,
             done=True,
             capture_before=False,
             capture_after=True,
@@ -208,7 +212,7 @@ def choose_action_with_llm(
         return PolicyDecision(
             action_id=None,
             action_type="click",
-            input_text=None,
+            text_to_type=None,
             done=True,
             capture_before=False,
             capture_after=True,
@@ -223,7 +227,7 @@ def choose_action_with_llm(
     return PolicyDecision(
         action_id=action_id,
         action_type=action_type,
-        input_text=data.get("input_text") or data.get("text"),
+        text_to_type=data.get("text_to_type") if isinstance(data.get("text_to_type"), str) else None,
         done=bool(data.get("done", False)),
         capture_before=bool(data.get("capture_before", True)),
         capture_after=bool(data.get("capture_after", True)),
@@ -280,7 +284,7 @@ class Policy:
             return PolicyDecision(
                 action_id=None,
                 action_type=fallback.action_type,
-                input_text=None,
+                text_to_type=None,
                 done=True,
                 capture_before=False,
                 capture_after=True,
@@ -297,7 +301,7 @@ class Policy:
             data["action_type"] = first.action_type
 
         # Ensure required keys exist with sane defaults
-        data.setdefault("input_text", data.get("text"))
+        data.setdefault("text_to_type", data.get("input_text") or data.get("text"))
         data.setdefault("capture_before", True)
         data.setdefault("capture_after", True)
         data.setdefault("label", f"after_action_{data['action_id']}")
@@ -307,7 +311,7 @@ class Policy:
         decision = PolicyDecision(
             action_id=data.get("action_id"),
             action_type=data.get("action_type", "click"),
-            input_text=data.get("input_text"),
+            text_to_type=data.get("text_to_type") if isinstance(data.get("text_to_type"), str) else None,
             done=bool(data.get("done")),
             capture_before=bool(data.get("capture_before")),
             capture_after=bool(data.get("capture_after")),

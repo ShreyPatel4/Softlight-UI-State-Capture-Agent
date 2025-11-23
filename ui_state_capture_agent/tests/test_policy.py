@@ -1,9 +1,6 @@
 import uuid
 
 from src.agent.dom_scanner import CandidateAction
-import uuid
-
-from src.agent.dom_scanner import CandidateAction
 from src.agent.policy import PolicyDecision, _extract_json, choose_action_with_llm
 from src.agent.task_spec import TaskSpec
 from src.models import FlowLog
@@ -61,7 +58,24 @@ def test_choose_action_valid_json():
     assert isinstance(decision, PolicyDecision)
     assert decision.action_id == "btn_0"
     assert decision.label == "after_action_btn_0"
-    assert decision.input_text is None
+    assert decision.text_to_type is None
+
+
+def test_choose_action_with_text_to_type():
+    candidates = [CandidateAction(id="input_1", action_type="type", locator="locator", description="Text input labeled 'Title'")]
+    llm = DummyLLM('{"action_id": "input_1", "action_type": "type", "text_to_type": "Some value", "done": false}')
+    task = TaskSpec(original_query="", app_name="linear", goal="go", start_url="http://example.com")
+
+    decision = choose_action_with_llm(
+        llm,
+        task,
+        task.app_name,
+        "http://example.com",
+        "",
+        candidates,
+    )
+
+    assert decision.text_to_type == "Some value"
 
 
 def test_choose_action_fallback_logs_warning():
@@ -86,3 +100,20 @@ def test_choose_action_fallback_logs_warning():
     assert decision.done is True
     assert session.logs
     assert any("LLM output missing valid JSON" in log.message for log in session.logs)
+
+
+def test_choose_action_invalid_json_sets_text_none():
+    candidates = [CandidateAction(id="btn_0", action_type="click", locator="locator", description="button A")]
+    llm = DummyLLM("{not json}")
+    task = TaskSpec(original_query="", app_name="linear", goal="go", start_url="http://example.com")
+
+    decision = choose_action_with_llm(
+        llm,
+        task,
+        task.app_name,
+        "http://example.com",
+        "",
+        candidates,
+    )
+
+    assert decision.text_to_type is None

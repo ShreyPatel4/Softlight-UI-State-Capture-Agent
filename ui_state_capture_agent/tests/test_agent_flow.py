@@ -64,6 +64,7 @@ class FakeCaptureManager:
             "url_changed": url_changed,
             "state_kind": state_kind,
             "diff_score": diff_score,
+            "action_description": action_description,
         }
         self.steps.append(step)
         return step
@@ -87,6 +88,9 @@ class FakeLocator:
         self.page.apply_action(self.locator)
 
     async def fill(self, text: str):
+        self.page.apply_action(self.locator, text)
+
+    async def type(self, text: str):
         self.page.apply_action(self.locator, text)
 
 
@@ -114,7 +118,8 @@ class FakePage:
             self.typed.append(text)
 
     async def content(self):
-        return f"<html><body><div>{self.state}</div></body></html>"
+        filler = "x" * (self.state * 50)
+        return f"<html><body><div>{filler}</div></body></html>"
 
     async def screenshot(self, full_page: bool = True):
         return b""
@@ -138,7 +143,7 @@ def make_decision(action_id: str, text: str | None = None) -> PolicyDecision:
     return PolicyDecision(
         action_id=action_id,
         action_type="click" if text is None else "type",
-        input_text=text,
+        text_to_type=text,
         done=False,
         capture_before=False,
         capture_after=True,
@@ -256,7 +261,7 @@ def test_steps_record_url_and_state(monkeypatch):
         PolicyDecision(
             action_id="url_change2",
             action_type="click",
-            input_text=None,
+            text_to_type=None,
             done=True,
             capture_before=False,
             capture_after=True,
@@ -295,6 +300,53 @@ def test_steps_record_url_and_state(monkeypatch):
     assert url_change_steps[0]["url_changed"] is True
 
 
+def test_type_action_executes_and_finishes(monkeypatch):
+    flow = type("Flow", (), {"id": uuid.uuid4(), "cancel_requested": False, "status": "running", "status_reason": None})()
+    session = DummySession(flow)
+    capture_manager = FakeCaptureManager(session)
+    page = FakePage()
+    browser = FakeBrowserSession(page)
+
+    decisions = [
+        PolicyDecision(
+            action_id="input_0",
+            action_type="type",
+            text_to_type="Hello world",
+            done=True,
+            capture_before=False,
+            capture_after=True,
+            label="typed",
+            reason="finish typing",
+            should_capture=True,
+        )
+    ]
+
+    async def fake_scan(_page, max_actions=40):  # noqa: ARG001
+        return [CandidateAction(id="input_0", action_type="type", locator="type_input", description="Text input labeled 'Title'")]
+
+    def fake_choose(*_args, **_kwargs):  # noqa: ARG001
+        return decisions.pop(0)
+
+    monkeypatch.setattr("src.agent.agent_loop.scan_candidate_actions", fake_scan)
+    monkeypatch.setattr("src.agent.agent_loop.choose_action_with_llm", fake_choose)
+
+    asyncio.run(
+        run_agent_loop(
+            task=type("Task", (), {"goal": "type a title", "app_name": "linear"})(),
+            flow=flow,
+            capture_manager=capture_manager,
+            hf_pipeline=None,
+            start_url=page.url,
+            browser_factory=lambda: browser,
+            max_steps=2,
+        )
+    )
+
+    assert "Hello world" in page.typed
+    assert any("Hello world" in step["action_description"] for step in capture_manager.steps if step["state_label"] != "initial_state")
+    assert flow.status_reason == "goal_reached"
+
+
 def test_done_without_change_marks_uncertain(monkeypatch):
     flow = type("Flow", (), {"id": uuid.uuid4(), "cancel_requested": False, "status": "running", "status_reason": None})()
     session = DummySession(flow)
@@ -306,7 +358,7 @@ def test_done_without_change_marks_uncertain(monkeypatch):
         PolicyDecision(
             action_id="no_change",
             action_type="click",
-            input_text=None,
+            text_to_type=None,
             done=True,
             capture_before=False,
             capture_after=True,
@@ -352,7 +404,7 @@ def test_capture_goal_can_finish_after_initial(monkeypatch):
         PolicyDecision(
             action_id="no_change",
             action_type="click",
-            input_text=None,
+            text_to_type=None,
             done=True,
             capture_before=False,
             capture_after=True,
@@ -398,7 +450,7 @@ def test_llm_fallback_still_captures(monkeypatch):
         PolicyDecision(
             action_id=None,
             action_type="click",
-            input_text=None,
+            text_to_type=None,
             done=True,
             capture_before=False,
             capture_after=True,

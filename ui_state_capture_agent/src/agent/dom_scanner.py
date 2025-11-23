@@ -21,6 +21,7 @@ async def scan_candidate_actions(page: Page, max_actions: int = 60) -> List[Cand
     Generic DOM scanner:
       - visible buttons and role=button
       - visible links
+      - visible text inputs / editable regions for typing
     Good enough for Linear / Notion without hardcoding workflows.
     """
     candidates: List[CandidateAction] = []
@@ -69,16 +70,11 @@ async def scan_candidate_actions(page: Page, max_actions: int = 60) -> List[Cand
             )
         )
 
-    # Text inputs, textareas, and editable regions for typing actions
-    input_locator = page.locator(
-        "input:not([type]), "
-        "input[type='text'], "
-        "input[type='search'], "
-        "input[type='email'], "
-        "input[type='password'], "
-        "textarea, "
-        "[contenteditable='true'], [contenteditable='']"
+    text_selector = (
+        "input[type='text'], input[type='search'], input[type='email'], "
+        "input[type='url'], textarea, [contenteditable='true']"
     )
+    input_locator = page.locator(text_selector)
     input_count = await input_locator.count()
     for i in range(input_count):
         if len(candidates) >= max_actions:
@@ -86,26 +82,82 @@ async def scan_candidate_actions(page: Page, max_actions: int = 60) -> List[Cand
         handle = input_locator.nth(i)
         if not await handle.is_visible():
             continue
+
+        element_id = (await handle.get_attribute("id") or "").strip()
+        label_text = ""
+        if element_id:
+            label_locator = page.locator(f"label[for=\"{element_id}\"]")
+            if await label_locator.count() > 0:
+                label_text = (await label_locator.first.inner_text() or "").strip()
+
         placeholder = (await handle.get_attribute("placeholder") or "").strip()
         aria_label = (await handle.get_attribute("aria-label") or "").strip()
-        name_attr = (await handle.get_attribute("name") or "").strip()
-        data_label = (await handle.get_attribute("data-placeholder") or "").strip()
-        inner_text = (await handle.inner_text() or "").strip()
 
-        descriptor = next(
+        aria_labelledby = (await handle.get_attribute("aria-labelledby") or "").strip()
+        labelledby_text = ""
+        if aria_labelledby:
+            for ref_id in aria_labelledby.split():
+                ref_locator = page.locator(f"#{ref_id}")
+                if await ref_locator.count() > 0:
+                    labelledby_text = (await ref_locator.first.inner_text() or "").strip()
+                    if labelledby_text:
+                        break
+
+        aria_describedby = (await handle.get_attribute("aria-describedby") or "").strip()
+        describedby_text = ""
+        if aria_describedby:
+            for ref_id in aria_describedby.split():
+                ref_locator = page.locator(f"#{ref_id}")
+                if await ref_locator.count() > 0:
+                    describedby_text = (await ref_locator.first.inner_text() or "").strip()
+                    if describedby_text:
+                        break
+
+        ancestor_hint = await handle.evaluate(
+            "(el) => { let node = el.parentElement; while (node) { const text = (node.innerText || '').trim(); if (text) { return text; } node = node.parentElement; } return ''; }"
+        )
+        ancestor_hint = ancestor_hint.strip() if isinstance(ancestor_hint, str) else ""
+
+        tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
+        contenteditable = bool((await handle.get_attribute("contenteditable")) is not None)
+        if tag_name == "textarea":
+            base_desc = "Multiline text area"
+        elif contenteditable:
+            base_desc = "Editable text area"
+        elif tag_name == "input":
+            input_type = (await handle.get_attribute("type") or "").lower()
+            if input_type == "search":
+                base_desc = "Search input"
+            else:
+                base_desc = "Text input"
+        else:
+            base_desc = "Text input"
+
+        hint = next(
             (
-                value
-                for value in [placeholder, aria_label, data_label, name_attr, inner_text]
-                if value
+                val
+                for val in [
+                    label_text or element_id,
+                    aria_label,
+                    labelledby_text,
+                    placeholder,
+                    describedby_text,
+                    ancestor_hint,
+                ]
+                if val
             ),
-            "",
+            None,
         )
-        desc = f"text input: {descriptor}" if descriptor else "text input"
-        locator_str = (
-            "input:not([type]), input[type='text'], input[type='search'], "
-            "input[type='email'], input[type='password'], textarea, [contenteditable='true'], [contenteditable=''] >> nth="
-            f"{i}"
-        )
+
+        if hint:
+            if placeholder and hint == placeholder:
+                desc = f"{base_desc} with placeholder '{hint}'"
+            else:
+                desc = f"{base_desc} labeled '{hint}'"
+        else:
+            desc = "Unnamed text input"
+
+        locator_str = f"{text_selector} >> nth={i}"
         candidates.append(
             CandidateAction(
                 id=f"input_{i}",

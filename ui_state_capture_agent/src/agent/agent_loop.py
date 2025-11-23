@@ -190,13 +190,20 @@ async def run_agent_loop(
                 log_flow_event(session, flow, "warning", "Selected candidate missing after filtering")
                 continue
 
+            action_description = decision.reason or selected_candidate.description
+            if decision.action_type == "type" and decision.text_to_type:
+                preview_text = decision.text_to_type
+                if len(preview_text) > 80:
+                    preview_text = preview_text[:77] + "..."
+                action_description = f"{selected_candidate.description}: \"{preview_text}\""
+
             if decision.capture_before:
                 step, last_captured_dom, last_captured_url, _, _, _ = await _maybe_capture_state(
                     capture_manager,
                     page,
                     flow,
                     f"before_action_{decision.action_id}",
-                    f"Before action: {decision.reason or selected_candidate.description}",
+                    f"Before action: {action_description}",
                     prev_dom,
                     last_captured_dom,
                     last_captured_url,
@@ -220,17 +227,44 @@ async def run_agent_loop(
                 elif decision.action_type == "type":
                     if not await locator.is_visible():
                         failure_counts[_candidate_key(selected_candidate)] += 1
-                        continue
-                    if not decision.input_text:
                         log_flow_event(
                             session,
                             flow,
                             "warning",
-                            "LLM did not provide input_text for type action; skipping",
+                            f"Target for {selected_candidate.id} not visible; skipping",
                         )
-                        failure_counts[_candidate_key(selected_candidate)] += 1
                         continue
-                    await locator.fill(decision.input_text)
+                    if not decision.text_to_type:
+                        log_flow_event(
+                            session,
+                            flow,
+                            "warning",
+                            "LLM did not provide text_to_type for type action; skipping",
+                        )
+                        continue
+                    try:
+                        await locator.click(timeout=2000)
+                    except PlaywrightTimeoutError:
+                        key = _candidate_key(selected_candidate)
+                        failure_counts[key] += 1
+                        if failure_counts[key] > max_action_failures:
+                            banned_actions.add(key)
+                            log_flow_event(
+                                session,
+                                flow,
+                                "warning",
+                                f"Banned {selected_candidate.id} after repeated timeouts",
+                            )
+                        continue
+                    try:
+                        await locator.fill(decision.text_to_type)
+                    except PlaywrightTimeoutError:
+                        raise
+                    except Exception:
+                        try:
+                            await locator.type(decision.text_to_type)
+                        except PlaywrightTimeoutError:
+                            raise
             except PlaywrightTimeoutError:
                 key = _candidate_key(selected_candidate)
                 failure_counts[key] += 1
@@ -263,7 +297,7 @@ async def run_agent_loop(
                 page,
                 flow,
                 decision.label or f"after_action_{decision.action_id}",
-                decision.reason or selected_candidate.description,
+                action_description,
                 current_dom,
                 last_captured_dom,
                 last_captured_url,
@@ -275,10 +309,10 @@ async def run_agent_loop(
                     session,
                     flow,
                     "info",
-                    f"step={step_index} url={current_url} action='{selected_candidate.description}' diff={captured_diff} captured=True",
+                    f"step={step_index} url={current_url} action='{action_description}' diff={captured_diff} captured=True",
                 )
 
-            summary_line = f"{step_index}. {decision.reason or selected_candidate.description}".strip()
+            summary_line = f"{step_index}. {action_description}".strip()
             history_summary = "\n".join([line for line in [history_summary, summary_line] if line])
 
             prev_url = current_url
