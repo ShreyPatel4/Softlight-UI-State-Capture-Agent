@@ -10,8 +10,13 @@
     <div class="alert error">{{ error_message }}</div>
     {% endif %}
     <header class="panel-header">
-        <h2>Recent Flows</h2>
-        <p>Showing the 50 most recent runs.</p>
+        <div>
+            <h2>Recent Flows</h2>
+            <p>Showing the 50 most recent runs.</p>
+        </div>
+        <div>
+            <button type="button" class="button" onclick="window.location.reload()">Refresh</button>
+        </div>
     </header>
     <div class="table-wrapper">
         <table>
@@ -23,6 +28,7 @@
                     <th>Run ID</th>
                     <th>Status</th>
                     <th>Started</th>
+                    <th>Finished</th>
                     <th>Details</th>
                 </tr>
             </thead>
@@ -35,11 +41,12 @@
                     <td>{{ flow.run_id }}</td>
                     <td><span class="status status-{{ flow.status | lower }}">{{ flow.status }}</span></td>
                     <td>{{ flow.started_at }}</td>
+                    <td>{{ flow.finished_at or "-" }}</td>
                     <td><a class="link" href="{{ url_for('flow_detail', flow_id=flow.id) }}">View</a></td>
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="6" class="empty">No flows yet.</td>
+                    <td colspan="8" class="empty">No flows yet.</td>
                 </tr>
                 {% endfor %}
             </tbody>

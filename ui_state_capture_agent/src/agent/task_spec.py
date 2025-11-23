@@ -13,6 +13,7 @@ class TaskSpec:
     start_url: str
     object_type: str = ""
     constraints: dict[str, str] = field(default_factory=dict)
+    known_app: bool = True
 
     def __post_init__(self) -> None:
         self.app_name = self.app_name.lower()
@@ -34,4 +35,5 @@ def parse_task_query(raw_query: str) -> TaskSpec:
         start_url=resolution.start_url,
         object_type="",
         constraints={},
+        known_app=resolution.known,
     )

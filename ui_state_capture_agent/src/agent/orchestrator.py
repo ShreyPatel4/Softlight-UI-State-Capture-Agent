@@ -63,6 +63,14 @@ async def run_task_query_async(raw_query: str) -> Flow:
                 f"Flow started app={task.app_name} start_url={task.start_url} goal={task.goal}",
             )
 
+            if not task.known_app:
+                log_flow_event(
+                    db,
+                    flow,
+                    "warning",
+                    "Unknown app requested; using generic resolver",
+                )
+
             hf_pipeline = create_policy_hf_pipeline()
 
             await run_agent_loop(

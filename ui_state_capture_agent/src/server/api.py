@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 from datetime import datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, List
 from uuid import UUID
@@ -53,6 +54,8 @@ class StepSummary(BaseModel):
     state_label: str
     description: str
     url: str | None
+    url_changed: bool | None
+    state_kind: str | None
 
 
 @app.post("/agent/run", response_model=RunTaskResponse)
@@ -135,6 +138,8 @@ def list_flow_steps(flow_id: str, db=Depends(get_db)):
             state_label=s.state_label,
             description=s.description,
             url=s.url,
+            url_changed=s.url_changed,
+            state_kind=s.state_kind,
         )
         for s in steps
     ]
@@ -175,6 +180,8 @@ def get_flow_status(flow_id: UUID, db: Session = Depends(get_db)) -> dict[str, A
                 "label": step.state_label,
                 "description": step.description,
                 "url": step.url,
+                "url_changed": step.url_changed,
+                "state_kind": step.state_kind,
             }
             for step in steps
         ],
@@ -182,17 +189,20 @@ def get_flow_status(flow_id: UUID, db: Session = Depends(get_db)) -> dict[str, A
 
 
 @app.get("/flows/{flow_id}/logs")
-def flow_logs(flow_id: uuid.UUID, db: Session = Depends(get_db)):
+def flow_logs(flow_id: uuid.UUID, request: Request, db: Session = Depends(get_db)):
+    flow = db.query(Flow).filter(Flow.id == flow_id).first()
+    if not flow:
+        raise HTTPException(status_code=404, detail="Flow not found")
     logs = (
         db.query(FlowLog)
         .filter(FlowLog.flow_id == flow_id)
         .order_by(FlowLog.created_at.asc())
         .all()
     )
-    return [
-        {"created_at": l.created_at.isoformat(), "level": l.level, "message": l.message}
-        for l in logs
-    ]
+    return templates.TemplateResponse(
+        "flow_logs.html",
+        {"request": request, "flow": flow, "logs": logs},
+    )
 
 
 @app.post("/flows/{flow_id}/cancel")

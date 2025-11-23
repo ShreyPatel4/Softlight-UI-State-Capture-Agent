@@ -1,19 +1,20 @@
+from __future__ import annotations
+
+from collections import defaultdict
 from datetime import datetime, timezone
+from typing import Callable
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from sqlalchemy.orm import Session
 
-from .task_spec import TaskSpec
-from .dom_scanner import scan_candidate_actions
-from .policy import PolicyLLMClient, choose_action_with_llm
+from ..config import settings
+from ..models import Flow, log_flow_event
 from .browser import BrowserSession
 from .capture import CaptureManager
-from ..models import Flow, log_flow_event
-from .state_diff import compute_dom_diff
-
-MAX_STEPS = 10
-MAX_LOW_DIFF_IN_A_ROW = 4
-LOW_DIFF_THRESHOLD = 0.02
+from .dom_scanner import CandidateAction, scan_candidate_actions
+from .policy import PolicyLLMClient, PolicyDecision, choose_action_with_llm
+from .state_diff import summarize_state_change
+from .task_spec import TaskSpec
 
 
 def _set_cancelled(flow: Flow, session: Session) -> None:
@@ -28,8 +29,47 @@ async def _check_cancel_requested(session: Session, flow: Flow) -> bool:
     refreshed = session.get(Flow, flow.id)
     if refreshed and refreshed.cancel_requested:
         _set_cancelled(flow, session)
+        log_flow_event(session, flow, "info", "Flow cancelled by user request")
         return True
     return False
+
+
+def _candidate_key(cand: CandidateAction) -> str:
+    return f"{cand.action_type}:{cand.locator}:{cand.description}"
+
+
+async def _capture_if_changed(
+    capture_manager: CaptureManager,
+    page,
+    flow: Flow,
+    label: str,
+    description: str,
+    dom_html: str,
+    prev_dom: str | None,
+    prev_url: str | None,
+    diff_threshold: float,
+    step_index: int | None,
+):
+    url_changed, diff_summary, diff_score, state_kind, changed = summarize_state_change(
+        prev_dom, dom_html, prev_url, page.url, diff_threshold
+    )
+    if not changed:
+        return None, prev_dom, prev_url
+
+    step = await capture_manager.capture_step(
+        page=page,
+        flow=flow,
+        label=label,
+        description=description,
+        dom_html=dom_html,
+        diff_summary=diff_summary,
+        diff_score=diff_score,
+        action_description=description,
+        url_changed=url_changed,
+        state_kind=state_kind,
+        step_index=step_index,
+    )
+    return step, dom_html, page.url
 
 
 async def run_agent_loop(
@@ -38,10 +78,19 @@ async def run_agent_loop(
     capture_manager: CaptureManager,
     hf_pipeline,
     start_url: str,
+    browser_factory: Callable[[], BrowserSession] = BrowserSession,
+    max_steps: int | None = None,
 ) -> None:
     session = capture_manager.db_session
     llm_client = PolicyLLMClient(hf_pipeline)
-    async with BrowserSession() as browser:
+    max_steps = max_steps or settings.max_steps
+    diff_threshold = settings.dom_diff_threshold
+    max_action_failures = settings.max_action_failures
+
+    failure_counts: dict[str, int] = defaultdict(int)
+    banned_actions: set[str] = set()
+
+    async with browser_factory() as browser:
         await browser.goto(start_url)
 
         page = browser.page
@@ -51,6 +100,8 @@ async def run_agent_loop(
         dom_html = await capture_manager.get_dom_snapshot(page)
         prev_url = page.url
         prev_dom = dom_html
+        last_captured_dom = dom_html
+        last_captured_url = prev_url
 
         await capture_manager.capture_step(
             page=page,
@@ -64,209 +115,205 @@ async def run_agent_loop(
             state_kind="url_change",
         )
 
-        candidates = await scan_candidate_actions(page, max_actions=60)
+        log_flow_event(session, flow, "info", "Captured initial_state")
+
+        candidates = await scan_candidate_actions(page, max_actions=40)
+        candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
         if not candidates:
-            print("[agent_loop] No candidate actions after initial load, finishing")
             flow.status = "no_actions"
-            flow.save()
+            flow.status_reason = "no_candidates"
+            session.add(flow)
+            session.commit()
+            log_flow_event(session, flow, "warning", "No candidate actions after initial load")
             return
 
         history_summary = ""
-
-        page = browser.page
-        if page is None:
-            return
 
         if await _check_cancel_requested(session, flow):
             return
 
         goal_reached = False
-        low_diff_streak = 0
 
-        for step_index in range(1, MAX_STEPS + 1):
+        for step_index in range(1, max_steps + 1):
             page = browser.page
             if page is None:
                 break
-
-            captured = False
 
             if await _check_cancel_requested(session, flow):
                 return
 
             if step_index != 1:
-                candidates = await scan_candidate_actions(page, max_actions=60)
-            print(f"[agent_loop] URL={page.url} candidates={len(candidates)}")
+                candidates = await scan_candidate_actions(page, max_actions=40)
+                candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
+
             if not candidates:
                 capture_manager.finish_flow(flow, status="no_actions")
+                log_flow_event(session, flow, "warning", "No candidate actions available")
                 break
 
-            print(f"[agent_loop] history_summary length={len(history_summary or '')}")
             current_url = page.url
-            decision = choose_action_with_llm(
+            decision: PolicyDecision = choose_action_with_llm(
                 llm_client,
                 task,
                 task.app_name,
                 current_url,
                 history_summary,
                 candidates,
+                session=session,
+                flow=flow,
             )
 
-            selected_candidate = next(
-                c for c in candidates if c.id == decision.action_id
-            )
-
-            if decision.done:
-                if decision.capture_after:
-                    await capture_manager.capture_step(
-                        page=page,
-                        flow=flow,
-                        label=decision.label or "done",
-                        description=decision.reason or "",
-                        dom_html=prev_dom,
-                        diff_summary=None,
-                        diff_score=None,
-                        action_description=decision.reason,
-                        url_changed=False,
-                        state_kind="dom_change",
-                        step_index=step_index,
+            if decision.action_id is None:
+                if decision.should_capture:
+                    await _capture_if_changed(
+                        capture_manager,
+                        page,
+                        flow,
+                        decision.label or "fallback_capture",
+                        decision.reason or "LLM fallback",
+                        prev_dom,
+                        last_captured_dom,
+                        last_captured_url,
+                        diff_threshold,
+                        step_index,
                     )
-
-                    captured = True
-
-                log_flow_event(
-                    session,
-                    flow,
-                    "INFO",
-                    f"step={step_index} url={page.url} action='{decision.reason or decision.label or 'done'}' diff=None captured={captured}",
-                )
-
-                goal_reached = True
-                break
-
-            if decision.capture_before:
-                await capture_manager.capture_step(
-                    page=page,
-                    flow=flow,
-                    label=(decision.label and f"before_{decision.label}")
-                    or f"before_{step_index}",
-                    description=f"Before action: {decision.reason or ''}",
-                    dom_html=prev_dom,
-                    diff_summary=None,
-                    diff_score=None,
-                    action_description=decision.reason,
-                    url_changed=False,
-                    state_kind="dom_change",
-                    step_index=step_index,
-                )
-
-                captured = True
-
-            locator = page.locator(selected_candidate.locator)
-            if decision.action_type == "click":
-                try:
-                    if not await locator.is_visible():
-                        print(
-                            f"[agent_loop] Skipping action {selected_candidate.id}: locator {selected_candidate.locator} is not visible"
-                        )
-                        continue
-                except PlaywrightTimeoutError:
-                    print(
-                        f"[agent_loop] Visibility check timed out for {selected_candidate.id} ({selected_candidate.locator}), skipping"
-                    )
-                    continue
-
-                try:
-                    await locator.click(timeout=2000)
-                except PlaywrightTimeoutError:
-                    print(
-                        f"[agent_loop] Click timed out for {selected_candidate.id} ({selected_candidate.locator}), skipping this action"
-                    )
-                    history_summary = (history_summary or "") + (
-                        f"\nAction {selected_candidate.id} with locator {selected_candidate.locator} failed (click timeout)."
-                    )
-                    continue
-            elif decision.action_type == "type":
-                if decision.text is None:
-                    raise ValueError("type action selected without text")
-                await locator.fill(decision.text)
-
-            await page.wait_for_timeout(1000)
-
-            current_dom = await capture_manager.get_dom_snapshot(page)
-            diff_summary, diff_score = compute_dom_diff(prev_dom, current_dom)
-
-            current_url = page.url
-
-            url_changed = current_url != prev_url
-
-            dialog_appeared = bool(diff_summary and "modal" in diff_summary.lower())
-
-            if url_changed:
-                state_kind = "url_change"
-            elif dialog_appeared:
-                state_kind = "dom_change_modal"
-            elif diff_score is not None and diff_score > 0.08:
-                state_kind = "dom_change"
-            else:
-                state_kind = "minor_change"
-
-            should_capture_after = bool(decision.capture_after)
-            if diff_score is not None and diff_score > 0.1:
-                should_capture_after = True
-
-            if should_capture_after:
-                await capture_manager.capture_step(
-                    page=page,
-                    flow=flow,
-                    label=decision.label or state_kind,
-                    description=decision.reason or "",
-                    dom_html=current_dom,
-                    diff_summary=diff_summary,
-                    diff_score=diff_score,
-                    action_description=decision.reason
-                    or selected_candidate.description,
-                    url_changed=url_changed,
-                    state_kind=state_kind,
-                    step_index=step_index,
-                )
-
-                captured = True
-
-            summary_line = f"{step_index}. {decision.reason or ''}".strip()
-            history_summary = "\n".join(
-                [line for line in [history_summary, summary_line] if line]
-            )
-
-            prev_url = current_url
-            prev_dom = current_dom
-
-            diff_str = f"{diff_score:.3f}" if diff_score is not None else "None"
-            log_flow_event(
-                session,
-                flow,
-                "INFO",
-                f"step={step_index} url={current_url} action='{selected_candidate.description}' diff={diff_str} captured={captured}",
-            )
-
-            if diff_score is None or diff_score < LOW_DIFF_THRESHOLD:
-                low_diff_streak += 1
-            else:
-                low_diff_streak = 0
-
-            if low_diff_streak >= MAX_LOW_DIFF_IN_A_ROW:
                 flow.status = "finished"
-                flow.status_reason = "low_diff_loop"
+                flow.status_reason = "llm_fallback"
                 flow.finished_at = datetime.now(timezone.utc)
                 session.add(flow)
                 session.commit()
                 break
 
+            selected_candidate = next((c for c in candidates if c.id == decision.action_id), None)
+            if selected_candidate is None:
+                log_flow_event(session, flow, "warning", "Selected candidate missing after filtering")
+                continue
+
+            if decision.done and decision.capture_after:
+                step, last_captured_dom, last_captured_url = await _capture_if_changed(
+                    capture_manager,
+                    page,
+                    flow,
+                    decision.label or "done",
+                    decision.reason or selected_candidate.description,
+                    prev_dom,
+                    last_captured_dom,
+                    last_captured_url,
+                    diff_threshold,
+                    step_index,
+                )
+                log_flow_event(
+                    session,
+                    flow,
+                    "info",
+                    f"step={step_index} url={page.url} action='{decision.reason or decision.label or 'done'}' captured={bool(step)}",
+                )
+                goal_reached = True
+                break
+
+            if decision.capture_before:
+                step, last_captured_dom, last_captured_url = await _capture_if_changed(
+                    capture_manager,
+                    page,
+                    flow,
+                    f"before_action_{decision.action_id}",
+                    f"Before action: {decision.reason or selected_candidate.description}",
+                    prev_dom,
+                    last_captured_dom,
+                    last_captured_url,
+                    diff_threshold,
+                    step_index,
+                )
+                if step:
+                    log_flow_event(
+                        session,
+                        flow,
+                        "info",
+                        f"Captured before_action for {decision.action_id}",
+                    )
+
+            locator = page.locator(selected_candidate.locator)
+            try:
+                if decision.action_type == "click":
+                    if not await locator.is_visible():
+                        failure_counts[_candidate_key(selected_candidate)] += 1
+                        continue
+                    await locator.click(timeout=2000)
+                elif decision.action_type == "type":
+                    if decision.text is None:
+                        failure_counts[_candidate_key(selected_candidate)] += 1
+                        continue
+                    await locator.fill(decision.text)
+            except PlaywrightTimeoutError:
+                key = _candidate_key(selected_candidate)
+                failure_counts[key] += 1
+                if failure_counts[key] > max_action_failures:
+                    banned_actions.add(key)
+                    log_flow_event(session, flow, "warning", f"Banned {selected_candidate.id} after repeated timeouts")
+                continue
+
+            await page.wait_for_timeout(800)
+
+            current_dom = await capture_manager.get_dom_snapshot(page)
+            current_url = page.url
+
+            url_changed, diff_summary, diff_score, state_kind, changed = summarize_state_change(
+                prev_dom, current_dom, prev_url, current_url, diff_threshold
+            )
+
+            if not changed:
+                key = _candidate_key(selected_candidate)
+                failure_counts[key] += 1
+                if failure_counts[key] > max_action_failures:
+                    banned_actions.add(key)
+                    log_flow_event(session, flow, "warning", f"Banned {selected_candidate.id} for no meaningful change")
+            else:
+                failure_counts[_candidate_key(selected_candidate)] = 0
+
+            if decision.capture_after and changed:
+                step, last_captured_dom, last_captured_url = await _capture_if_changed(
+                    capture_manager,
+                    page,
+                    flow,
+                    decision.label or f"after_action_{decision.action_id}",
+                    decision.reason or selected_candidate.description,
+                    current_dom,
+                    last_captured_dom,
+                    last_captured_url,
+                    diff_threshold,
+                    step_index,
+                )
+                if step:
+                    log_flow_event(
+                        session,
+                        flow,
+                        "info",
+                        f"step={step_index} url={current_url} action='{selected_candidate.description}' diff={diff_score} captured=True",
+                    )
+
+            summary_line = f"{step_index}. {decision.reason or selected_candidate.description}".strip()
+            history_summary = "\n".join([line for line in [history_summary, summary_line] if line])
+
+            prev_url = current_url
+            prev_dom = current_dom
+
+            if banned_actions:
+                candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
+
         else:
+            flow.status_reason = "max steps reached"
             capture_manager.finish_flow(flow, status="max_steps_reached")
+            log_flow_event(session, flow, "info", "Max steps reached, stopping loop")
 
         if goal_reached:
             flow.status = "finished"
             flow.status_reason = "goal_reached"
+            flow.finished_at = datetime.now(timezone.utc)
+            session.add(flow)
+            session.commit()
+        elif flow.status == "running":
+            flow.status = "finished"
+            flow.status_reason = flow.status_reason or "stopped"
             flow.finished_at = datetime.now(timezone.utc)
             session.add(flow)
             session.commit()

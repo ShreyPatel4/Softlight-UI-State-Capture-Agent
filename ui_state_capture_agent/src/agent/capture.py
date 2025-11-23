@@ -21,10 +21,11 @@ class CaptureManager:
 
     def start_flow(self, app_name: str, task_id: str, task_title: str, task_blurb: str) -> Flow:
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        prefix = f"{app_name}/{task_id}/{run_id}"
+        normalized_app = app_name.lower()
+        prefix = f"{normalized_app}/{task_id}/{run_id}"
 
         flow = Flow(
-            app_name=app_name,
+            app_name=normalized_app,
             task_id=task_id,
             task_title=task_title,
             task_blurb=task_blurb,

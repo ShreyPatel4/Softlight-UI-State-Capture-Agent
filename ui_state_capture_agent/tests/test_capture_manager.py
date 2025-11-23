@@ -1,13 +1,8 @@
 import sys
 import asyncio
-from pathlib import Path
 from types import SimpleNamespace
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from src.agent.capture import CaptureManager  # noqa: E402
+from src.agent.capture import CaptureManager
 
 
 class DummySession:
@@ -30,8 +25,8 @@ class DummySession:
     def commit(self):
         return None
 
-    def refresh(self, *_args, **_kwargs):
-        return None
+    def refresh(self, obj, *_args, **_kwargs):
+        return obj
 
 
 class DummyStorage:
@@ -48,7 +43,7 @@ class DummyPage:
     async def content(self):
         return "<html></html>"
 
-def test_capture_step_accepts_dom_changed_kwargs():
+def test_capture_step_accepts_state_kind_and_url_changed():
     capture_manager = CaptureManager(DummySession(), DummyStorage())
     flow = SimpleNamespace(id="flow1", prefix="pref")
 
@@ -58,16 +53,14 @@ def test_capture_step_accepts_dom_changed_kwargs():
             flow=flow,
             label="test_state",
             dom_html="<html></html>",
-            diff_summary=None,
-            diff_score=None,
+            diff_summary="Minor or no structural change",
+            diff_score=0.0,
             action_description="",
             url_changed=True,
-            dom_changed=True,
-            modal_change=False,
             state_kind="dom_change",
         )
     )
 
     assert step.state_label == "test_state"
     assert step.url_changed is True
-    assert step.dom_changed is True
+    assert step.state_kind == "dom_change"

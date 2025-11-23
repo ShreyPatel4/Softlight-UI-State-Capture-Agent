@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     transformers_cache: str | None = None
     hf_home: str | None = None
     headless: bool = True
+    max_steps: int = 10
+    dom_diff_threshold: float = 0.05
+    max_action_failures: int = 2
 
     class Config:
         env_file = ".env"

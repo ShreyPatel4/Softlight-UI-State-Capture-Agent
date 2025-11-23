@@ -1,34 +1,62 @@
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Sequence
+
+from sqlalchemy.orm import Session
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 from ..config import settings
+from ..models import Flow, log_flow_event
 from .dom_scanner import CandidateAction
 from .task_spec import TaskSpec
 
 
 def _extract_json(text: str) -> dict | None:
     """
-    Try to extract and parse the first JSON object from an LLM response.
-    Returns a dict or None if parsing fails.
-    """
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
+    Extract the last JSON object from noisy LLM output.
 
-    candidate = text[start : end + 1]
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
+    The function strips code fences and ignores any chatter surrounding the JSON
+    payload. When multiple JSON-looking regions exist, the last valid object is
+    returned. None is returned when parsing fails.
+    """
+
+    def _strip_code_fences(payload: str) -> str:
+        fenced = re.findall(r"```(?:json)?\s*(.*?)```", payload, re.DOTALL | re.IGNORECASE)
+        if fenced:
+            return fenced[-1]
+        return payload
+
+    cleaned = _strip_code_fences(text.strip())
+
+    # Find all balanced JSON-looking spans
+    spans: list[str] = []
+    depth = 0
+    start_idx: int | None = None
+    for idx, ch in enumerate(cleaned):
+        if ch == "{":
+            if depth == 0:
+                start_idx = idx
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start_idx is not None:
+                    spans.append(cleaned[start_idx : idx + 1])
+
+    for candidate in reversed(spans):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+    return None
 
 
 @dataclass
 class PolicyDecision:
-    action_id: str
+    action_id: Optional[str]
     action_type: Literal["click", "type"]
     text: Optional[str]
     done: bool
@@ -36,6 +64,7 @@ class PolicyDecision:
     capture_after: bool
     label: Optional[str]
     reason: Optional[str]
+    should_capture: bool = True
 
 
 POLICY_SYSTEM_PROMPT = """
@@ -176,37 +205,46 @@ def choose_action_with_llm(
     url: str,
     history_summary: str,
     candidates: Sequence[CandidateAction],
+    session: Session | None = None,
+    flow: Flow | None = None,
 ) -> PolicyDecision:
     prompt = build_policy_prompt(task, app_name, url, history_summary, candidates)
     raw = llm.complete(prompt).strip()
 
+    def _warn(message: str) -> None:
+        if session and flow:
+            snippet = raw[:200].replace("\n", " ")
+            log_flow_event(session, flow, "warning", f"{message}: {snippet}")
+
     data = _extract_json(raw)
     if data is None:
-        fallback = choose_fallback_action(task.goal, candidates)
+        _warn("LLM output missing valid JSON")
         return PolicyDecision(
-            action_id=fallback.id,
-            action_type=fallback.action_type,
+            action_id=None,
+            action_type="click",
             text=None,
-            done=False,
-            capture_before=True,
+            done=True,
+            capture_before=False,
             capture_after=True,
-            label=f"after_{fallback.id}",
+            label="fallback_capture",
             reason="Fallback decision because model output was not valid JSON",
+            should_capture=True,
         )
 
     action_id = data.get("action_id")
     cand_map = {c.id: c for c in candidates}
     if action_id not in cand_map:
-        fallback = choose_fallback_action(task.goal, candidates)
+        _warn("LLM output missing or invalid action_id")
         return PolicyDecision(
-            action_id=fallback.id,
-            action_type=fallback.action_type,
+            action_id=None,
+            action_type="click",
             text=None,
-            done=False,
-            capture_before=True,
+            done=True,
+            capture_before=False,
             capture_after=True,
-            label=f"after_{fallback.id}",
+            label="fallback_capture",
             reason="Fallback decision because model output did not match a candidate id",
+            should_capture=True,
         )
 
     cand = cand_map[action_id]
@@ -219,8 +257,9 @@ def choose_action_with_llm(
         done=bool(data.get("done", False)),
         capture_before=bool(data.get("capture_before", True)),
         capture_after=bool(data.get("capture_after", True)),
-        label=data.get("label"),
+        label=data.get("label") or f"after_action_{action_id}",
         reason=data.get("reason"),
+        should_capture=True,
     )
 
 
@@ -244,7 +283,7 @@ class Policy:
     def _extract_json(self, raw: str) -> dict:
         data = _extract_json(raw.strip())
         if data is None:
-            raise ValueError("bad_json")
+            return {}
         return data
 
     async def choose_action(
@@ -265,20 +304,19 @@ class Policy:
             candidates=candidates,
         )
         raw = self._run_hf(prompt)
-
-        try:
-            data = self._extract_json(raw)
-        except ValueError:
+        data = self._extract_json(raw)
+        if not data:
             fallback = choose_fallback_action(task.goal, candidates)
             return PolicyDecision(
-                action_id=fallback.id,
+                action_id=None,
                 action_type=fallback.action_type,
                 text=None,
-                done=False,
-                capture_before=True,
+                done=True,
+                capture_before=False,
                 capture_after=True,
-                label=f"after_{fallback.id}",
+                label="fallback_capture",
                 reason="Fallback decision because model output was not valid JSON",
+                should_capture=True,
             )
 
         # Validate action_id
@@ -292,7 +330,7 @@ class Policy:
         data.setdefault("text", None)
         data.setdefault("capture_before", True)
         data.setdefault("capture_after", True)
-        data.setdefault("label", f"after_{data['action_id']}")
+        data.setdefault("label", f"after_action_{data['action_id']}")
         data.setdefault("done", False)
         data.setdefault("reason", "Model did not provide a reason")
 
@@ -305,6 +343,7 @@ class Policy:
             capture_after=bool(data.get("capture_after")),
             label=data.get("label"),
             reason=data.get("reason"),
+            should_capture=True,
         )
 
         print(

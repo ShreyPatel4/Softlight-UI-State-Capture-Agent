@@ -7,6 +7,7 @@ class AppResolution:
     app_name: str
     start_url: str
     normalized_goal: str
+    known: bool = True
 
 
 class AppResolver:
@@ -40,7 +41,7 @@ class AppResolver:
 
         if not app:
             for name in self.known_apps:
-                if name in lower:
+                if lower.startswith(f"{name}:") or name in lower:
                     app = name
                     break
 
@@ -50,11 +51,15 @@ class AppResolver:
 
         app = app.lower()
         start_url = self.known_apps.get(app) if app else ""
+        known = app in self.known_apps
         if not start_url and app:
             start_url = f"https://{app}.com"
+        if not start_url:
+            start_url = "https://example.com"
 
         return AppResolution(
             app_name=app,
             start_url=start_url,
             normalized_goal=goal or text,
+            known=known,
         )

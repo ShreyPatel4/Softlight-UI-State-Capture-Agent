@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+    <header class="panel-header">
+        <div>
+            <p class="eyebrow">Flow logs</p>
+            <h2>{{ flow.task_title }}</h2>
+            <p class="muted">{{ flow.task_blurb }}</p>
+        </div>
+        <div>
+            <a class="link" href="{{ url_for('flow_detail', flow_id=flow.id) }}">Back to flow</a>
+        </div>
+    </header>
+    <div class="table-wrapper">
+        <table>
+            <thead>
+                <tr>
+                    <th>Timestamp</th>
+                    <th>Level</th>
+                    <th>Message</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for log in logs %}
+                <tr>
+                    <td>{{ log.created_at }}</td>
+                    <td><span class="status status-{{ log.level | lower }}">{{ log.level }}</span></td>
+                    <td>{{ log.message }}</td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="3" class="empty">No logs recorded.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}

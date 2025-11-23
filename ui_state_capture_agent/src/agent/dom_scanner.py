@@ -34,9 +34,11 @@ async def scan_candidate_actions(page: Page, max_actions: int = 60) -> List[Cand
         handle = button_locator.nth(i)
         if not await handle.is_visible():
             continue
-        text = (await handle.inner_text() or "").strip()
+        text = (await handle.get_attribute("aria-label") or await handle.inner_text() or "").strip()
         locator_str = f"button, [role='button'] >> nth={i}"
-        desc = f"button with text '{text}'" if text else f"button index {i}"
+        desc = (
+            f"button \"{text}\"" if text else f"button index {i}"
+        )
         candidates.append(
             CandidateAction(
                 id=f"btn_{i}",
@@ -55,9 +57,9 @@ async def scan_candidate_actions(page: Page, max_actions: int = 60) -> List[Cand
         handle = link_locator.nth(i)
         if not await handle.is_visible():
             continue
-        text = (await handle.inner_text() or "").strip()
+        text = (await handle.inner_text() or await handle.get_attribute("aria-label") or "").strip()
         locator_str = f"a[href] >> nth={i}"
-        desc = f"link with text '{text}'" if text else f"link index {i}"
+        desc = f"link \"{text}\"" if text else f"link index {i}"
         candidates.append(
             CandidateAction(
                 id=f"link_{i}",
@@ -79,7 +81,9 @@ async def scan_candidate_actions(page: Page, max_actions: int = 60) -> List[Cand
         placeholder = await handle.get_attribute("placeholder")
         ph = (placeholder or "").strip()
         locator_str = f"input, textarea >> nth={i}"
-        desc = f"input with placeholder '{ph}'" if ph else "input/textarea"
+        desc = (
+            f"input placeholder \"{ph}\"" if ph else "input/textarea"
+        )
         candidates.append(
             CandidateAction(
                 id=f"input_{i}",
