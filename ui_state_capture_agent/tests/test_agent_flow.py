@@ -87,10 +87,10 @@ class FakeLocator:
             raise PlaywrightTimeoutError("timeout")
         self.page.apply_action(self.locator)
 
-    async def fill(self, text: str):
+    async def fill(self, text: str, timeout: int | None = None):  # noqa: ARG002
         self.page.apply_action(self.locator, text)
 
-    async def type(self, text: str):
+    async def type(self, text: str, timeout: int | None = None):  # noqa: ARG002
         self.page.apply_action(self.locator, text)
 
 
@@ -320,12 +320,14 @@ def test_type_action_executes_and_finishes(monkeypatch):
             should_capture=True,
         )
     ]
+    call_count = {"count": 0}
 
     async def fake_scan(_page, max_actions=40):  # noqa: ARG001
         return [CandidateAction(id="input_0", action_type="type", locator="type_input", description="Text input labeled 'Title'")]
 
     def fake_choose(*_args, **_kwargs):  # noqa: ARG001
-        return decisions.pop(0)
+        call_count["count"] += 1
+        return decisions[min(call_count["count"] - 1, len(decisions) - 1)]
 
     monkeypatch.setattr("src.agent.agent_loop.scan_candidate_actions", fake_scan)
     monkeypatch.setattr("src.agent.agent_loop.choose_action_with_llm", fake_choose)
@@ -345,6 +347,8 @@ def test_type_action_executes_and_finishes(monkeypatch):
     assert "Hello world" in page.typed
     assert any("Hello world" in step["action_description"] for step in capture_manager.steps if step["state_label"] != "initial_state")
     assert flow.status_reason == "goal_reached"
+    assert any("typed value='Hello world'" in log.message for log in session.logs)
+    assert call_count["count"] == 1
 
 
 def test_done_without_change_marks_uncertain(monkeypatch):

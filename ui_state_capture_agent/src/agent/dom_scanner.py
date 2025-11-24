@@ -72,7 +72,7 @@ async def scan_candidate_actions(page: Page, max_actions: int = 60) -> List[Cand
 
     text_selector = (
         "input[type='text'], input[type='search'], input[type='email'], "
-        "input[type='url'], textarea, [contenteditable='true']"
+        "input[type='url'], textarea, [contenteditable='true'], [role='textbox']"
     )
     input_locator = page.locator(text_selector)
     input_count = await input_locator.count()
@@ -149,13 +149,16 @@ async def scan_candidate_actions(page: Page, max_actions: int = 60) -> List[Cand
             None,
         )
 
-        if hint:
-            if placeholder and hint == placeholder:
-                desc = f"{base_desc} with placeholder '{hint}'"
-            else:
-                desc = f"{base_desc} labeled '{hint}'"
+        semantic_hint = hint or base_desc
+        normalized = semantic_hint.lower()
+        if any(keyword in normalized for keyword in ["title", "name", "subject"]):
+            desc = f"type {semantic_hint}".strip()
+        elif any(keyword in normalized for keyword in ["description", "detail", "note", "comment", "summary"]):
+            desc = f"type {semantic_hint}".strip()
+        elif hint:
+            desc = f"type into {semantic_hint}".strip()
         else:
-            desc = "Unnamed text input"
+            desc = "type into text input"
 
         locator_str = f"{text_selector} >> nth={i}"
         candidates.append(

@@ -153,6 +153,18 @@ async def run_agent_loop(
                 break
 
             current_url = page.url
+            type_candidates = [c.id for c in candidates if c.action_type == "type"]
+            log_flow_event(
+                session,
+                flow,
+                "info",
+                "policy_call step={step} url={url} candidates={count} type_ids={types}".format(
+                    step=step_index,
+                    url=current_url,
+                    count=len(candidates),
+                    types=type_candidates[:5],
+                ),
+            )
             decision: PolicyDecision = choose_action_with_llm(
                 llm_client,
                 task,
@@ -162,6 +174,7 @@ async def run_agent_loop(
                 candidates,
                 session=session,
                 flow=flow,
+                step_index=step_index,
             )
 
             if decision.action_id is None:
@@ -241,7 +254,9 @@ async def run_agent_loop(
                             "warning",
                             "LLM did not provide text_to_type for type action; skipping",
                         )
+                        failure_counts[_candidate_key(selected_candidate)] += 1
                         continue
+                    typed_value = decision.text_to_type
                     try:
                         await locator.click(timeout=2000)
                     except PlaywrightTimeoutError:
@@ -257,20 +272,78 @@ async def run_agent_loop(
                             )
                         continue
                     try:
-                        await locator.fill(decision.text_to_type)
+                        await locator.fill(typed_value, timeout=4000)
+                        log_flow_event(
+                            session,
+                            flow,
+                            "info",
+                            f"typed value='{typed_value}' into action='{selected_candidate.description}' selector='{selected_candidate.locator}'",
+                        )
                     except PlaywrightTimeoutError:
-                        raise
-                    except Exception:
+                        key = _candidate_key(selected_candidate)
+                        failure_counts[key] += 1
+                        log_flow_event(
+                            session,
+                            flow,
+                            "warning",
+                            f"Typing timed out for {selected_candidate.id}; attempting fallback type",
+                        )
                         try:
-                            await locator.type(decision.text_to_type)
+                            await locator.type(typed_value, timeout=4000)
+                            log_flow_event(
+                                session,
+                                flow,
+                                "info",
+                                f"typed value='{typed_value}' into action='{selected_candidate.description}' selector='{selected_candidate.locator}'",
+                            )
                         except PlaywrightTimeoutError:
-                            raise
+                            if failure_counts[key] > max_action_failures:
+                                banned_actions.add(key)
+                                log_flow_event(
+                                    session,
+                                    flow,
+                                    "warning",
+                                    f"Banned {selected_candidate.id} after repeated timeouts",
+                                )
+                            continue
+                        except Exception as exc:
+                            log_flow_event(
+                                session,
+                                flow,
+                                "warning",
+                                f"Fallback type failed for {selected_candidate.id}: {exc}",
+                            )
+                            continue
+                    except Exception as exc:
+                        log_flow_event(
+                            session,
+                            flow,
+                            "warning",
+                            f"Typing failed for {selected_candidate.id}: {exc}",
+                        )
+                        failure_counts[_candidate_key(selected_candidate)] += 1
+                        continue
             except PlaywrightTimeoutError:
                 key = _candidate_key(selected_candidate)
                 failure_counts[key] += 1
                 if failure_counts[key] > max_action_failures:
                     banned_actions.add(key)
                     log_flow_event(session, flow, "warning", f"Banned {selected_candidate.id} after repeated timeouts")
+                continue
+            except Exception as exc:
+                key = _candidate_key(selected_candidate)
+                failure_counts[key] += 1
+                log_flow_event(
+                    session,
+                    flow,
+                    "warning",
+                    f"Action {selected_candidate.id} failed: {exc}",
+                )
+                if failure_counts[key] > max_action_failures:
+                    banned_actions.add(key)
+                    log_flow_event(
+                        session, flow, "warning", f"Banned {selected_candidate.id} after repeated failures"
+                    )
                 continue
 
             await page.wait_for_timeout(800)

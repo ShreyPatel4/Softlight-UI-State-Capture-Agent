@@ -70,7 +70,7 @@ class PolicyDecision:
 
 
 POLICY_SYSTEM_PROMPT = """
-Return only a single JSON object that follows this schema:
+Return only a single JSON object that follows this schema exactly:
 {
   "action_id": "<one of the provided candidate ids>",
   "action_type": "click" | "type",
@@ -82,19 +82,17 @@ Return only a single JSON object that follows this schema:
   "reason": "<brief reason>"
 }
 
-Rules:
-- You will receive generic candidate actions. Some have "action_type": "click" and others have "action_type": "type".
+Rules for this small, deterministic model:
+- Be literal and avoid creativity; follow the goal text exactly.
 - Choose exactly one of the provided candidates and never invent ids.
-- For click actions, ignore text_to_type or set it to null.
-- For type actions, set text_to_type to the exact text that should be typed based on the user goal.
-- Map goal parts to appropriate fields: names/titles/subjects go to inputs mentioning title, name, or subject; descriptions/details/comments go to inputs mentioning description, details, notes, or comment.
-- For creation or confirmation steps, keep done=false until the action would complete the goal.
-- If no action is needed or progress cannot be made, set action_id to null and text_to_type to null.
-- Always emit JSON only; no prose, no markdown, no code fences.
-
-Example outputs for a generic goal "create item named 'Softlight agent test issue'":
-{"action_id":"btn_0","action_type":"click","text_to_type":null,"done":false,"capture_before":true,"capture_after":true,"label":"open_form","reason":"open the creation form"}
-{"action_id":"input_1","action_type":"type","text_to_type":"Softlight agent test issue","done":false,"capture_before":false,"capture_after":true,"label":"title_entered","reason":"type the requested title"}
+- If the user goal includes phrases like "named X", "with title X", "name it X", or "call it X":
+  1) First pick a type action whose description mentions "title" or "name" and set text_to_type exactly to X.
+  2) Only after filling the title, choose a click action that creates or confirms the item (e.g. "Create", "Save", "Submit").
+- For type actions always include text_to_type as a string; for click actions set text_to_type to null.
+- Map goal parts to fields: names/titles/subjects go to inputs mentioning title or name; descriptions/details/notes/comments go to inputs mentioning description, details, notes, or comment.
+- Keep done=false until the action would complete the goal; set done=true only when the goal is achieved or nothing more is needed.
+- If no action is possible, set action_id to null, text_to_type to null, capture_after=true, and done=true.
+- Respond with a single JSON object only; no markdown, no code fences, and no extra text. If multiple JSON objects are generated, the last one is used.
 """
 
 
@@ -181,6 +179,7 @@ def choose_action_with_llm(
     candidates: Sequence[CandidateAction],
     session: Session | None = None,
     flow: Flow | None = None,
+    step_index: int | None = None,
 ) -> PolicyDecision:
     prompt = build_policy_prompt(task, app_name, url, history_summary, candidates)
     raw = llm.complete(prompt).strip()
@@ -190,10 +189,36 @@ def choose_action_with_llm(
             snippet = raw[:200].replace("\n", " ")
             log_flow_event(session, flow, "warning", f"{message}: {snippet}")
 
+    def _log_decision(decision: PolicyDecision, *, fallback: bool = False) -> None:
+        if not (session and flow):
+            return
+        try:
+            action_lookup = {c.id: c for c in candidates}
+            selected = action_lookup.get(decision.action_id or "")
+            selected_kind = selected.action_type if selected else decision.action_type
+            preview_text = (decision.text_to_type or "").strip()
+            has_text = bool(preview_text)
+            if len(preview_text) > 60:
+                preview_text = preview_text[:57] + "..."
+            message = (
+                f"policy_decision step={step_index if step_index is not None else '?'} "
+                f"action_id={decision.action_id or 'none'} kind={selected_kind} "
+                f"capture={decision.should_capture} done={decision.done} "
+                f"text={'yes' if has_text else 'no'}"
+            )
+            if has_text:
+                message += f" text_preview='{preview_text}'"
+            if fallback:
+                message = "fallback_" + message
+            log_flow_event(session, flow, "info", message)
+        except Exception:
+            # Logging must never break the flow
+            return
+
     data = _extract_json(raw)
     if data is None:
         _warn("LLM output missing valid JSON")
-        return PolicyDecision(
+        decision = PolicyDecision(
             action_id=None,
             action_type="click",
             text_to_type=None,
@@ -204,12 +229,14 @@ def choose_action_with_llm(
             reason="Fallback decision because model output was not valid JSON",
             should_capture=True,
         )
+        _log_decision(decision, fallback=True)
+        return decision
 
     action_id = data.get("action_id")
     cand_map = {c.id: c for c in candidates}
     if action_id not in cand_map:
         _warn("LLM output missing or invalid action_id")
-        return PolicyDecision(
+        decision = PolicyDecision(
             action_id=None,
             action_type="click",
             text_to_type=None,
@@ -220,11 +247,15 @@ def choose_action_with_llm(
             reason="Fallback decision because model output did not match a candidate id",
             should_capture=True,
         )
+        _log_decision(decision, fallback=True)
+        return decision
 
     cand = cand_map[action_id]
     action_type = data.get("action_type") or cand.action_type
+    if action_type not in {"click", "type"}:
+        action_type = cand.action_type
 
-    return PolicyDecision(
+    decision = PolicyDecision(
         action_id=action_id,
         action_type=action_type,
         text_to_type=data.get("text_to_type") if isinstance(data.get("text_to_type"), str) else None,
@@ -235,6 +266,10 @@ def choose_action_with_llm(
         reason=data.get("reason"),
         should_capture=True,
     )
+
+    _log_decision(decision)
+
+    return decision
 
 
 class Policy:

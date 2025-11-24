@@ -78,6 +78,29 @@ def test_choose_action_with_text_to_type():
     assert decision.text_to_type == "Some value"
 
 
+def test_choose_action_logs_decision_with_text():
+    candidates = [CandidateAction(id="input_1", action_type="type", locator="locator", description="type issue title")]
+    llm = DummyLLM('{"action_id": "input_1", "action_type": "type", "text_to_type": "Title here", "done": false}')
+    task = TaskSpec(original_query="", app_name="linear", goal="create issue named 'Title here'", start_url="http://example.com")
+    flow = type("Flow", (), {"id": uuid.uuid4()})()
+    session = DummySession(flow)
+
+    decision = choose_action_with_llm(
+        llm,
+        task,
+        task.app_name,
+        "http://example.com",
+        "",
+        candidates,
+        session=session,
+        flow=flow,
+        step_index=2,
+    )
+
+    assert decision.text_to_type == "Title here"
+    assert any("policy_decision" in log.message and "text_preview" in log.message for log in session.logs)
+
+
 def test_choose_action_fallback_logs_warning():
     candidates = [CandidateAction(id="btn_0", action_type="click", locator="locator", description="button A")]
     llm = DummyLLM("nonsense without json")
