@@ -367,6 +367,12 @@ async def run_agent_loop(
             url_changed, diff_summary, diff_score, state_kind, changed = summarize_state_change(
                 prev_dom, current_dom, prev_url, current_url, diff_threshold
             )
+            has_progress = bool(
+                url_changed
+                or (diff_score is not None and diff_score >= diff_threshold)
+                or state_kind != "no_change"
+                or changed
+            )
 
             if not changed:
                 key = _candidate_key(selected_candidate)
@@ -377,7 +383,7 @@ async def run_agent_loop(
             else:
                 failure_counts[_candidate_key(selected_candidate)] = 0
 
-            if decision.action_id == last_action_id and not changed:
+            if decision.action_id == last_action_id and not has_progress:
                 repeated_no_progress_count += 1
             else:
                 repeated_no_progress_count = 0
@@ -386,12 +392,16 @@ async def run_agent_loop(
 
             if repeated_no_progress_count >= STUCK_NO_PROGRESS_THRESHOLD:
                 flow.status_reason = "policy_stuck_no_progress"
-                capture_manager.finish_flow(flow, status="policy_stuck_no_progress")
+                capture_manager.finish_flow(flow, status="finished")
                 log_flow_event(
                     session,
                     flow,
                     "warning",
-                    f"Detected repeated no-progress action selections for {decision.action_id}; stopping early",
+                    (
+                        "policy_stuck_no_progress "
+                        f"step={step_index} action_id={decision.action_id} "
+                        f"repeated_no_progress_count={repeated_no_progress_count}"
+                    ),
                 )
                 break
 
