@@ -178,13 +178,13 @@ async def run_agent_loop(
             )
 
             if decision.action_id is None:
-                if decision.should_capture:
+                if decision.capture:
                     await _maybe_capture_state(
                         capture_manager,
                         page,
                         flow,
-                        decision.label or "fallback_capture",
-                        decision.reason or "LLM fallback",
+                        "fallback_capture",
+                        decision.notes or "LLM fallback",
                         prev_dom,
                         last_captured_dom,
                         last_captured_url,
@@ -203,32 +203,12 @@ async def run_agent_loop(
                 log_flow_event(session, flow, "warning", "Selected candidate missing after filtering")
                 continue
 
-            action_description = decision.reason or selected_candidate.description
+            action_description = decision.notes or selected_candidate.description
             if decision.action_type == "type" and decision.text_to_type:
                 preview_text = decision.text_to_type
                 if len(preview_text) > 80:
                     preview_text = preview_text[:77] + "..."
                 action_description = f"{selected_candidate.description}: \"{preview_text}\""
-
-            if decision.capture_before:
-                step, last_captured_dom, last_captured_url, _, _, _ = await _maybe_capture_state(
-                    capture_manager,
-                    page,
-                    flow,
-                    f"before_action_{decision.action_id}",
-                    f"Before action: {action_description}",
-                    prev_dom,
-                    last_captured_dom,
-                    last_captured_url,
-                    diff_threshold,
-                )
-                if step:
-                    log_flow_event(
-                        session,
-                        flow,
-                        "info",
-                        f"Captured before_action for {decision.action_id}",
-                    )
 
             locator = page.locator(selected_candidate.locator)
             try:
@@ -277,7 +257,7 @@ async def run_agent_loop(
                             session,
                             flow,
                             "info",
-                            f"typed value='{typed_value}' into action='{selected_candidate.description}' selector='{selected_candidate.locator}'",
+                            f"typed text into action='{selected_candidate.description}' selector='{selected_candidate.locator}'",
                         )
                     except PlaywrightTimeoutError:
                         key = _candidate_key(selected_candidate)
@@ -294,7 +274,7 @@ async def run_agent_loop(
                                 session,
                                 flow,
                                 "info",
-                                f"typed value='{typed_value}' into action='{selected_candidate.description}' selector='{selected_candidate.locator}'",
+                                f"typed text into action='{selected_candidate.description}' selector='{selected_candidate.locator}'",
                             )
                         except PlaywrightTimeoutError:
                             if failure_counts[key] > max_action_failures:
@@ -364,12 +344,12 @@ async def run_agent_loop(
             else:
                 failure_counts[_candidate_key(selected_candidate)] = 0
 
-            should_force_capture = bool(decision.capture_after or decision.should_capture or decision.done)
+            should_force_capture = bool(decision.capture or decision.done)
             step, last_captured_dom, last_captured_url, captured_changed, captured_state_kind, captured_diff = await _maybe_capture_state(
                 capture_manager,
                 page,
                 flow,
-                decision.label or f"after_action_{decision.action_id}",
+                f"after_action_{decision.action_id}",
                 action_description,
                 current_dom,
                 last_captured_dom,

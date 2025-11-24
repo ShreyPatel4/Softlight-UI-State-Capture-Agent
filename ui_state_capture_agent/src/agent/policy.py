@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any, Literal, Optional, Sequence
 
 from sqlalchemy.orm import Session
-
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 from ..config import settings
@@ -13,86 +12,29 @@ from .dom_scanner import CandidateAction
 from .task_spec import TaskSpec
 
 
-def _extract_json(text: str) -> dict | None:
-    """
-    Extract the last JSON object from noisy LLM output.
-
-    The function strips code fences and ignores any chatter surrounding the JSON
-    payload. When multiple JSON-looking regions exist, the last valid object is
-    returned. None is returned when parsing fails.
-    """
-
-    try:
-        def _strip_code_fences(payload: str) -> str:
-            fenced = re.findall(r"```(?:json)?\s*(.*?)```", payload, re.DOTALL | re.IGNORECASE)
-            if fenced:
-                return fenced[-1]
-            return payload
-
-        cleaned = _strip_code_fences(text.strip())
-
-        spans: list[str] = []
-        depth = 0
-        start_idx: int | None = None
-        for idx, ch in enumerate(cleaned):
-            if ch == "{":
-                if depth == 0:
-                    start_idx = idx
-                depth += 1
-            elif ch == "}":
-                if depth > 0:
-                    depth -= 1
-                    if depth == 0 and start_idx is not None:
-                        spans.append(cleaned[start_idx : idx + 1])
-
-        for candidate in reversed(spans):
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-    except Exception:
-        return None
-
-    return None
-
-
 @dataclass
 class PolicyDecision:
     action_id: Optional[str]
     action_type: Literal["click", "type"]
     text_to_type: Optional[str]
+    capture: bool
     done: bool
-    capture_before: bool
-    capture_after: bool
-    label: Optional[str]
-    reason: Optional[str]
-    should_capture: bool = True
+    notes: str
 
 
 POLICY_SYSTEM_PROMPT = """
-Return only a single JSON object that follows this schema exactly:
-{
-  "action_id": "<one of the provided candidate ids>",
-  "action_type": "click" | "type",
-  "text_to_type": "<text to type>" | null,
-  "done": true | false,
-  "capture_before": true | false,
-  "capture_after": true | false,
-  "label": "<short snake_case label>",
-  "reason": "<brief reason>"
-}
+You are a deterministic UI policy that selects exactly one action for the next step.
+Return exactly one JSON object and nothing else. No natural language. No markdown. No code fences.
 
-Rules for this small, deterministic model:
-- Be literal and avoid creativity; follow the goal text exactly.
-- Choose exactly one of the provided candidates and never invent ids.
-- If the user goal includes phrases like "named X", "with title X", "name it X", or "call it X":
-  1) First pick a type action whose description mentions "title" or "name" and set text_to_type exactly to X.
-  2) Only after filling the title, choose a click action that creates or confirms the item (e.g. "Create", "Save", "Submit").
-- For type actions always include text_to_type as a string; for click actions set text_to_type to null.
-- Map goal parts to fields: names/titles/subjects go to inputs mentioning title or name; descriptions/details/notes/comments go to inputs mentioning description, details, notes, or comment.
-- Keep done=false until the action would complete the goal; set done=true only when the goal is achieved or nothing more is needed.
-- If no action is possible, set action_id to null, text_to_type to null, capture_after=true, and done=true.
-- Respond with a single JSON object only; no markdown, no code fences, and no extra text. If multiple JSON objects are generated, the last one is used.
+JSON schema:
+{
+  "action_id": "<one of the provided candidate ids or null>",
+  "action_type": "click" or "type",
+  "text_to_type": "<text to type>" or null,
+  "capture": true or false,
+  "done": true or false,
+  "notes": "<short free text or empty string>"
+}
 """
 
 
@@ -103,9 +45,6 @@ def build_policy_prompt(
     history_summary: str,
     candidates: Sequence[CandidateAction],
 ) -> str:
-    """
-    Build the text prompt for Qwen.
-    """
     lines: list[str] = []
     lines.append(POLICY_SYSTEM_PROMPT.strip())
     lines.append("")
@@ -118,22 +57,57 @@ def build_policy_prompt(
     lines.append("History summary:")
     lines.append(history_summary if history_summary else "(no previous actions)")
     lines.append("")
-    lines.append("Candidate actions:")
+    lines.append("Candidate actions (choose one id):")
     for cand in candidates:
         lines.append(
-            f"  - id={cand.id}  type={cand.action_type}  description={cand.description}"
+            f"  - id={cand.id} type={cand.action_type} description={cand.description}"
         )
     lines.append("")
     lines.append(
-        "Return a single JSON object that follows the schema exactly. "
-        "Do not include any text before or after the JSON."
+        "Respond with exactly one JSON object and nothing else. Do not use markdown or code fences."
     )
     return "\n".join(lines)
 
 
-def choose_fallback_action(
-    goal: str, candidates: Sequence[CandidateAction]
-) -> CandidateAction:
+def _extract_json(text: str) -> tuple[dict | None, str | None]:
+    """Robustly extract a JSON object from LLM chatter without raising."""
+
+    if text is None or not str(text).strip():
+        return None, "empty_output"
+
+    cleaned = str(text).strip()
+
+    fence_pattern = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
+    match = fence_pattern.match(cleaned)
+    if match:
+        cleaned = match.group(1).strip()
+
+    try:
+        obj = json.loads(cleaned)
+        if isinstance(obj, dict):
+            return obj, None
+        return None, "json_not_object"
+    except json.JSONDecodeError:
+        pass
+
+    last_open = cleaned.rfind("{")
+    last_close = cleaned.rfind("}")
+    if last_open < 0 or last_close < 0 or last_close < last_open:
+        return None, "no_brace_block_found"
+
+    snippet = cleaned[last_open : last_close + 1]
+    try:
+        obj = json.loads(snippet)
+        if isinstance(obj, dict):
+            return obj, None
+        return None, "json_not_object"
+    except json.JSONDecodeError as exc:  # noqa: BLE001
+        return None, f"json_decode_error:{exc.msg}"
+    except Exception:
+        return None, "json_parse_exception"
+
+
+def choose_fallback_action(goal: str, candidates: Sequence[CandidateAction]) -> CandidateAction:
     def score(cand: CandidateAction) -> int:
         g = set(goal.lower().split())
         d = set(cand.description.lower().split())
@@ -170,6 +144,75 @@ class PolicyLLMClient:
         return self.generate(prompt)
 
 
+def _validate_and_normalize_decision(
+    data: dict,
+    candidates: Sequence[CandidateAction],
+    *,
+    session: Session | None = None,
+    flow: Flow | None = None,
+    step_index: int | None = None,
+) -> PolicyDecision:
+    candidate_ids = {c.id for c in candidates}
+    type_candidates = [c for c in candidates if c.action_type == "type"]
+    type_candidate_ids = {c.id for c in type_candidates}
+
+    action_id = data.get("action_id")
+    action_type = (data.get("action_type") or "click").lower()
+    text_to_type = data.get("text_to_type")
+    capture = bool(data.get("capture", True))
+    done = bool(data.get("done", False))
+    notes = str(data.get("notes") or "").strip()
+
+    def log(level: str, message: str) -> None:
+        if session and flow:
+            log_flow_event(
+                session,
+                flow,
+                level,
+                f"{message} step={step_index if step_index is not None else '?'}",
+            )
+
+    if action_id is not None and action_id not in candidate_ids:
+        log("warning", f"policy_invalid_action_id id={action_id}")
+        action_id = None
+
+    if action_type == "type":
+        if not (isinstance(text_to_type, str) and text_to_type.strip()):
+            log("warning", "policy_type_without_text")
+            action_type = "click"
+            text_to_type = None
+        elif not type_candidates:
+            log("warning", "policy_requested_type_but_no_type_candidates")
+            return PolicyDecision(
+                action_id=None,
+                action_type="click",
+                text_to_type=None,
+                capture=True,
+                done=True,
+                notes="fallback: no type candidates",
+            )
+        elif action_id is not None and action_id not in type_candidate_ids:
+            log("warning", "policy_type_action_on_non_type_candidate")
+            action_id = type_candidates[0].id
+    elif action_type != "click":
+        log("warning", f"policy_invalid_action_type type={action_type}")
+        action_type = "click"
+        text_to_type = None
+
+    if action_id is None and not done and candidates:
+        action_id = candidates[0].id
+        log("info", f"policy_missing_action_id_using_first_candidate id={action_id}")
+
+    return PolicyDecision(
+        action_id=action_id,
+        action_type=action_type if action_type in {"click", "type"} else "click",
+        text_to_type=text_to_type if isinstance(text_to_type, str) else None,
+        capture=capture,
+        done=done,
+        notes=notes,
+    )
+
+
 def choose_action_with_llm(
     llm: PolicyLLMClient,
     task: TaskSpec,
@@ -182,104 +225,65 @@ def choose_action_with_llm(
     step_index: int | None = None,
 ) -> PolicyDecision:
     prompt = build_policy_prompt(task, app_name, url, history_summary, candidates)
-    raw = llm.complete(prompt).strip()
+    raw = llm.complete(prompt)
 
-    def _warn(message: str) -> None:
+    if session and flow:
+        log_flow_event(
+            session,
+            flow,
+            "debug",
+            f"policy_raw_output step={step_index} text={(raw or '')[:500].replace('\n', ' ')}",
+        )
+
+    parsed, reason = _extract_json(raw)
+    if parsed is None:
         if session and flow:
-            snippet = raw[:200].replace("\n", " ")
-            log_flow_event(session, flow, "warning", f"{message}: {snippet}")
-
-    def _log_decision(decision: PolicyDecision, *, fallback: bool = False) -> None:
-        if not (session and flow):
-            return
-        try:
-            action_lookup = {c.id: c for c in candidates}
-            selected = action_lookup.get(decision.action_id or "")
-            selected_kind = selected.action_type if selected else decision.action_type
-            preview_text = (decision.text_to_type or "").strip()
-            has_text = bool(preview_text)
-            if len(preview_text) > 60:
-                preview_text = preview_text[:57] + "..."
-            message = (
-                f"policy_decision step={step_index if step_index is not None else '?'} "
-                f"action_id={decision.action_id or 'none'} kind={selected_kind} "
-                f"capture={decision.should_capture} done={decision.done} "
-                f"text={'yes' if has_text else 'no'}"
+            log_flow_event(
+                session,
+                flow,
+                "warning",
+                f"policy_parse_failure step={step_index} reason={reason} head={(raw or '')[:120].replace('\n', ' ')}",
             )
-            if has_text:
-                message += f" text_preview='{preview_text}'"
-            if fallback:
-                message = "fallback_" + message
-            log_flow_event(session, flow, "info", message)
-        except Exception:
-            # Logging must never break the flow
-            return
-
-    data = _extract_json(raw)
-    if data is None:
-        _warn("LLM output missing valid JSON")
-        decision = PolicyDecision(
+        return PolicyDecision(
             action_id=None,
             action_type="click",
             text_to_type=None,
+            capture=True,
             done=True,
-            capture_before=False,
-            capture_after=True,
-            label="fallback_capture",
-            reason="Fallback decision because model output was not valid JSON",
-            should_capture=True,
+            notes=f"fallback_due_to_parse_failure:{reason}",
         )
-        _log_decision(decision, fallback=True)
-        return decision
 
-    action_id = data.get("action_id")
-    cand_map = {c.id: c for c in candidates}
-    if action_id not in cand_map:
-        _warn("LLM output missing or invalid action_id")
-        decision = PolicyDecision(
-            action_id=None,
-            action_type="click",
-            text_to_type=None,
-            done=True,
-            capture_before=False,
-            capture_after=True,
-            label="fallback_capture",
-            reason="Fallback decision because model output did not match a candidate id",
-            should_capture=True,
-        )
-        _log_decision(decision, fallback=True)
-        return decision
-
-    cand = cand_map[action_id]
-    action_type = data.get("action_type") or cand.action_type
-    if action_type not in {"click", "type"}:
-        action_type = cand.action_type
-
-    decision = PolicyDecision(
-        action_id=action_id,
-        action_type=action_type,
-        text_to_type=data.get("text_to_type") if isinstance(data.get("text_to_type"), str) else None,
-        done=bool(data.get("done", False)),
-        capture_before=bool(data.get("capture_before", True)),
-        capture_after=bool(data.get("capture_after", True)),
-        label=data.get("label") or f"after_action_{action_id}",
-        reason=data.get("reason"),
-        should_capture=True,
+    decision = _validate_and_normalize_decision(
+        parsed,
+        candidates,
+        session=session,
+        flow=flow,
+        step_index=step_index,
     )
 
-    _log_decision(decision)
+    if session and flow:
+        log_flow_event(
+            session,
+            flow,
+            "info",
+            "policy_decision step={step} action_id={aid} type={atype} capture={cap} done={done}"
+            .format(
+                step=step_index,
+                aid=decision.action_id,
+                atype=decision.action_type,
+                cap=decision.capture,
+                done=decision.done,
+            ),
+        )
 
     return decision
 
 
 class Policy:
-    """
-    LLM backed policy that chooses the next UI action using a Hugging Face model.
-    """
+    """LLM backed policy that chooses the next UI action."""
 
     def __init__(self, model_name: str | None = None) -> None:
         model_name = model_name or settings.hf_model_name
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.generator = create_policy_hf_pipeline(model_name)
 
     def _run_hf(self, prompt: str) -> str:
@@ -289,12 +293,6 @@ class Policy:
         )[0]["generated_text"]
         return out
 
-    def _extract_json(self, raw: str) -> dict:
-        data = _extract_json(raw.strip())
-        if data is None:
-            return {}
-        return data
-
     async def choose_action(
         self,
         task: TaskSpec,
@@ -302,9 +300,6 @@ class Policy:
         history_summary: str,
         url: str,
     ) -> PolicyDecision:
-        """
-        Decide the next action. Called from the agent loop.
-        """
         prompt = build_policy_prompt(
             task=task,
             app_name=task.app_name,
@@ -313,63 +308,16 @@ class Policy:
             candidates=candidates,
         )
         raw = self._run_hf(prompt)
-        data = self._extract_json(raw)
-        if not data:
+        parsed, reason = _extract_json(raw)
+        if parsed is None:
             fallback = choose_fallback_action(task.goal, candidates)
             return PolicyDecision(
                 action_id=None,
                 action_type=fallback.action_type,
                 text_to_type=None,
+                capture=True,
                 done=True,
-                capture_before=False,
-                capture_after=True,
-                label="fallback_capture",
-                reason="Fallback decision because model output was not valid JSON",
-                should_capture=True,
+                notes=f"fallback_due_to_parse_failure:{reason}",
             )
 
-        # Validate action_id
-        valid_ids = {c.id for c in candidates}
-        if data.get("action_id") not in valid_ids:
-            first = candidates[0]
-            data["action_id"] = first.id
-            data["action_type"] = first.action_type
-
-        # Ensure required keys exist with sane defaults
-        data.setdefault("text_to_type", data.get("input_text") or data.get("text"))
-        data.setdefault("capture_before", True)
-        data.setdefault("capture_after", True)
-        data.setdefault("label", f"after_action_{data['action_id']}")
-        data.setdefault("done", False)
-        data.setdefault("reason", "Model did not provide a reason")
-
-        decision = PolicyDecision(
-            action_id=data.get("action_id"),
-            action_type=data.get("action_type", "click"),
-            text_to_type=data.get("text_to_type") if isinstance(data.get("text_to_type"), str) else None,
-            done=bool(data.get("done")),
-            capture_before=bool(data.get("capture_before")),
-            capture_after=bool(data.get("capture_after")),
-            label=data.get("label"),
-            reason=data.get("reason"),
-            should_capture=True,
-        )
-
-        print(
-            "[policy] decision:",
-            json.dumps(
-                {
-                    "app": task.app_name,
-                    "goal": task.goal,
-                    "action_id": decision.action_id,
-                    "action_type": decision.action_type,
-                    "capture_before": decision.capture_before,
-                    "capture_after": decision.capture_after,
-                    "label": decision.label,
-                    "done": decision.done,
-                },
-                ensure_ascii=False,
-            ),
-        )
-
-        return decision
+        return _validate_and_normalize_decision(parsed, candidates)

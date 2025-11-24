@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 from datetime import datetime
-from datetime import datetime
 from pathlib import Path
 from typing import Any, List
 from uuid import UUID
@@ -19,12 +18,15 @@ from ..agent.orchestrator import run_task_query_async
 from ..models import Flow, FlowLog, Step, get_db
 from ..storage.base import StorageBackend
 from ..storage.minio_store import get_storage
+from .api_agent_a import router as agent_a_router
 
 BASE_DIR = Path(__file__).parent
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
+
+app.include_router(agent_a_router)
 
 
 class RunTaskRequest(BaseModel):

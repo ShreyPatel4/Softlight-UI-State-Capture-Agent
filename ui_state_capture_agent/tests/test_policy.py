@@ -34,11 +34,11 @@ class DummySession:
 
 
 def test_extract_json_variants():
-    assert _extract_json('{"a": 1}') == {"a": 1}
+    assert _extract_json('{"a": 1}')[0] == {"a": 1}
     fenced = """```json\n{\n  \"a\": 2\n}\n```"""
-    assert _extract_json(fenced) == {"a": 2}
+    assert _extract_json(fenced)[0] == {"a": 2}
     noisy = "Here is the result: {\"a\":3} and some trailing text"
-    assert _extract_json(noisy) == {"a": 3}
+    assert _extract_json(noisy)[0] == {"a": 3}
 
 
 def test_choose_action_valid_json():
@@ -57,7 +57,6 @@ def test_choose_action_valid_json():
 
     assert isinstance(decision, PolicyDecision)
     assert decision.action_id == "btn_0"
-    assert decision.label == "after_action_btn_0"
     assert decision.text_to_type is None
 
 
@@ -98,7 +97,7 @@ def test_choose_action_logs_decision_with_text():
     )
 
     assert decision.text_to_type == "Title here"
-    assert any("policy_decision" in log.message and "text_preview" in log.message for log in session.logs)
+    assert any("policy_decision" in log.message for log in session.logs)
 
 
 def test_choose_action_fallback_logs_warning():
@@ -122,7 +121,7 @@ def test_choose_action_fallback_logs_warning():
     assert decision.action_id is None
     assert decision.done is True
     assert session.logs
-    assert any("LLM output missing valid JSON" in log.message for log in session.logs)
+    assert any("policy_parse_failure" in log.message for log in session.logs)
 
 
 def test_choose_action_invalid_json_sets_text_none():

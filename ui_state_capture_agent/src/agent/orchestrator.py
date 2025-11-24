@@ -21,6 +21,7 @@ class FlowSummary:
     run_id: str
     status: str
     task_title: Optional[str] = None
+    status_reason: Optional[str] = None
 
 
 def _get_run_lock() -> asyncio.Lock:
@@ -104,6 +105,7 @@ async def run_task_query_async(raw_query: str) -> FlowSummary:
                 run_id=flow.run_id,
                 status=flow.status,
                 task_title=getattr(flow, "task_title", None),
+                status_reason=getattr(flow, "status_reason", None),
             )
 
             return summary
