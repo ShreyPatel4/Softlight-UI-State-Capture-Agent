@@ -90,6 +90,9 @@ async def run_agent_loop(
 
     failure_counts: dict[str, int] = defaultdict(int)
     banned_actions: set[str] = set()
+    last_action_id: str | None = None
+    repeated_no_progress_count = 0
+    STUCK_NO_PROGRESS_THRESHOLD = 3
 
     async with browser_factory() as browser:
         await browser.goto(start_url)
@@ -373,6 +376,24 @@ async def run_agent_loop(
                     log_flow_event(session, flow, "warning", f"Banned {selected_candidate.id} for no meaningful change")
             else:
                 failure_counts[_candidate_key(selected_candidate)] = 0
+
+            if decision.action_id == last_action_id and not changed:
+                repeated_no_progress_count += 1
+            else:
+                repeated_no_progress_count = 0
+
+            last_action_id = decision.action_id
+
+            if repeated_no_progress_count >= STUCK_NO_PROGRESS_THRESHOLD:
+                flow.status_reason = "policy_stuck_no_progress"
+                capture_manager.finish_flow(flow, status="policy_stuck_no_progress")
+                log_flow_event(
+                    session,
+                    flow,
+                    "warning",
+                    f"Detected repeated no-progress action selections for {decision.action_id}; stopping early",
+                )
+                break
 
             should_force_capture = bool(decision.capture or decision.done)
             step, last_captured_dom, last_captured_url, captured_changed, captured_state_kind, captured_diff = await _maybe_capture_state(
