@@ -37,6 +37,7 @@ class CandidateAction:
     is_type_target: bool = False
     goal_match_score: float = 0.0
     source_hint: Optional[str] = None
+    xpath: Optional[str] = None
 
     def __post_init__(self) -> None:
         # Preserve backward compatibility by mirroring the action_type in kind and
@@ -308,6 +309,41 @@ async def scan_candidate_actions(
                         el.__softlight_uid = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
                     }
                     return el.__softlight_uid;
+                }
+                """
+            )
+        except Exception:
+            return None
+
+    async def get_xpath(handle) -> Optional[str]:
+        try:
+            return await handle.evaluate(
+                """
+                (el) => {
+                    function getXPath(node) {
+                        if (node.nodeType !== Node.ELEMENT_NODE) return "";
+                        if (node.id) {
+                            return 'id("' + node.id + '")';
+                        }
+                        const parts = [];
+                        while (node && node.nodeType === Node.ELEMENT_NODE) {
+                            let index = 1;
+                            let sibling = node.previousSibling;
+                            while (sibling) {
+                                if (sibling.nodeType === Node.ELEMENT_NODE &&
+                                    sibling.nodeName === node.nodeName) {
+                                    index += 1;
+                                }
+                                sibling = sibling.previousSibling;
+                            }
+                            const tagName = node.nodeName.toLowerCase();
+                            const part = index > 1 ? `${tagName}[${index}]` : tagName;
+                            parts.unshift(part);
+                            node = node.parentNode;
+                        }
+                        return "/" + parts.join("/");
+                    }
+                    return getXPath(el);
                 }
                 """
             )
@@ -643,6 +679,8 @@ async def scan_candidate_actions(
         desc_hint = primary_hint or placeholder_value or text_content
         description = f"{base_desc} \"{desc_hint}\"" if desc_hint else base_desc
 
+        xpath = await get_xpath(handle)
+
         candidate = CandidateAction(
             id=f"input_{type_index}",
             locator=f"{type_selector} >> nth={nth_index}",
@@ -666,6 +704,7 @@ async def scan_candidate_actions(
             is_type_target=True,
             goal_match_score=goal_match_score,
             source_hint="playwright_scan",
+            xpath=xpath,
         )
         return element_uid, candidate
 
@@ -764,10 +803,154 @@ async def scan_candidate_actions(
             len([c for c in candidates if c.is_type_target]),
         )
 
+    async def augment_with_type_candidates_from_xpath(start_index: int) -> None:
+        try:
+            nodes = await page.evaluate(
+                """
+                () => {
+                    function getXPath(node) {
+                        if (node.nodeType !== Node.ELEMENT_NODE) return "";
+                        if (node.id) {
+                            return 'id("' + node.id + '")';
+                        }
+                        const parts = [];
+                        while (node && node.nodeType === Node.ELEMENT_NODE) {
+                            let index = 1;
+                            let sibling = node.previousSibling;
+                            while (sibling) {
+                                if (sibling.nodeType === Node.ELEMENT_NODE &&
+                                    sibling.nodeName === node.nodeName) {
+                                    index += 1;
+                                }
+                                sibling = sibling.previousSibling;
+                            }
+                            const tagName = node.nodeName.toLowerCase();
+                            const part = index > 1 ? `${tagName}[${index}]` : tagName;
+                            parts.unshift(part);
+                            node = node.parentNode;
+                        }
+                        return "/" + parts.join("/");
+                    }
+
+                    const selector = 'input, textarea, [contenteditable], [role="textbox"]';
+                    const els = Array.from(document.querySelectorAll(selector));
+                    return els.map((el) => {
+                        const tag = el.tagName ? el.tagName.toLowerCase() : "";
+                        const placeholder = el.getAttribute("placeholder") || "";
+                        const aria = el.getAttribute("aria-label") || "";
+                        const text = (el.innerText || el.value || "").trim();
+                        return {
+                            xpath: getXPath(el),
+                            tag,
+                            placeholder,
+                            aria,
+                            text,
+                        };
+                    });
+                }
+                """
+            )
+        except Exception as exc:
+            logging.debug("xpath_type_scan: eval_failed step=%s error=%r", step_index, exc)
+            return
+
+        if not nodes:
+            logging.debug("xpath_type_scan: no_nodes step=%s", step_index)
+            return
+
+        logging.debug("xpath_type_scan: step=%s count=%s", step_index, len(nodes))
+
+        type_index = start_index
+        for idx, node in enumerate(nodes):
+            if len(candidates) >= max_actions:
+                logging.debug(
+                    "xpath_type_scan abort: max_actions reached step=%s len=%s",
+                    step_index,
+                    len(candidates),
+                )
+                return
+
+            xpath = node.get("xpath") or None
+            if not xpath:
+                continue
+
+            if any(c.xpath == xpath for c in candidates if c.xpath):
+                continue
+
+            tag = node.get("tag") or ""
+            placeholder = node.get("placeholder") or ""
+            aria = node.get("aria") or ""
+            text = node.get("text") or ""
+            visible_text = aria or placeholder or text
+
+            semantics = compute_semantics(
+                tag=tag,
+                role=None,
+                label=visible_text,
+                placeholder=placeholder,
+                text=text,
+                input_type=None,
+            )
+
+            ancestor_text = ""
+            section_label = None
+            is_primary_cta = False
+            is_nav_link = False
+            is_form_field = True
+
+            goal_match_score = compute_goal_score(visible_text)
+            if goal_has_concrete_name and _has_text_field_keyword(visible_text):
+                goal_match_score += 1.0
+
+            description = f"xpath text entry \"{visible_text[:40]}\"" if visible_text else "xpath text entry"
+
+            cand = CandidateAction(
+                id=f"xpath_input_{type_index}",
+                locator=f"xpath={xpath}",
+                action_type="type",
+                description=description,
+                tag=tag,
+                role=None,
+                aria_label=aria,
+                type=None,
+                text=visible_text,
+                semantics=semantics,
+                bounding_box=None,
+                kind="type",
+                visible_text=visible_text,
+                placeholder=placeholder,
+                ancestor_text=ancestor_text,
+                section_label=section_label,
+                is_primary_cta=is_primary_cta,
+                is_nav_link=is_nav_link,
+                is_form_field=is_form_field,
+                is_type_target=True,
+                goal_match_score=goal_match_score,
+                source_hint="xpath_scan",
+                xpath=xpath,
+            )
+
+            add_candidate(cand)
+            logging.debug(
+                "xpath_type_scan[%s]: added_type_candidate id=%s xpath=%s desc=%s",
+                idx,
+                cand.id,
+                xpath,
+                description,
+            )
+            type_index += 1
+
+        logging.debug(
+            "xpath_type_scan done step=%s total_xpath_type_candidates=%s",
+            step_index,
+            len([c for c in candidates if c.is_type_target and c.source_hint == "xpath_scan"]),
+        )
+
     for cand in snapshot_text_candidates:
         add_candidate(cand)
 
     await augment_with_type_candidates_from_playwright(next_type_index())
+    await augment_with_type_candidates_from_xpath(next_type_index())
 
     live_type_candidates = [
         c for c in candidates if c.is_type_target and c.source_hint == "playwright_scan"

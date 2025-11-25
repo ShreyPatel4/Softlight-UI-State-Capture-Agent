@@ -33,6 +33,8 @@ class FakeHandle:
             return self.tag_name
         if "__softlight_uid" in script:
             return self.uid
+        if "getXPath" in script:
+            return f"/{self.tag_name}"
         if "const parts" in script:
             return []
         if "const chain" in script:
@@ -81,6 +83,8 @@ class FakePage:
         return FakeLocator()
 
     async def evaluate(self, _script):
+        if "const selector" in _script:
+            return []
         return {"width": 0, "height": 0}
 
 
@@ -97,6 +101,25 @@ class FakePageLive(FakePage):
                 return FakeLocatorWithHandle(self.handles[0])
             return FakeLocatorMultiple(self.handles)
         return FakeLocator()
+
+    async def evaluate(self, script):
+        if "const selector" in script:
+            nodes = []
+            for idx, handle in enumerate(self.handles):
+                placeholder = handle.attributes.get("placeholder", "")
+                aria = handle.attributes.get("aria-label", "")
+                text = handle.inner_text_value or ""
+                nodes.append(
+                    {
+                        "xpath": f"/{handle.tag_name}[{idx + 1}]",
+                        "tag": handle.tag_name,
+                        "placeholder": placeholder,
+                        "aria": aria,
+                        "text": text,
+                    }
+                )
+            return nodes
+        return await super().evaluate(script)
 
 
 def test_contenteditable_field_is_type_candidate():
@@ -145,6 +168,9 @@ def test_live_page_contenteditable_type_candidates():
     assert type_candidates, "expected live scan to find a type candidate"
     assert any(c.id in type_ids for c in type_candidates), "type_ids should include live candidates"
     assert any("title" in (c.visible_text or c.description or "").lower() for c in type_candidates)
+    assert any(
+        (c.locator or "").startswith("xpath=") or getattr(c, "xpath", None) for c in type_candidates
+    ), "expected at least one xpath-based type candidate"
 
 
 def test_live_page_multiple_inputs_sets_type_ids_and_logs(caplog):

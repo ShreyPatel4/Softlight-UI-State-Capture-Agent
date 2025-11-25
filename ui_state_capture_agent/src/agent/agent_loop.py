@@ -310,6 +310,12 @@ async def run_agent_loop(
                         locator_count = await locator.count()
                     except Exception:
                         locator_count = 1
+                    if locator_count == 0 and getattr(selected_candidate, "xpath", None):
+                        locator = page.locator(f"xpath={selected_candidate.xpath}")
+                        try:
+                            locator_count = await locator.count()
+                        except Exception:
+                            locator_count = 1
                     if locator_count == 0:
                         log_flow_event(
                             session,
