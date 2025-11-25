@@ -564,8 +564,6 @@ async def scan_candidate_actions(
         )
 
     type_selector = "input, textarea, [contenteditable], [role='textbox']"
-    allowed_input_types = {"text", "search", "email", "url", "number", "password"}
-
     async def make_type_candidate_from_locator(handle, nth_index: int, type_index: int) -> tuple[Optional[str], Optional[CandidateAction]]:
         tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
         contenteditable_attr = await handle.get_attribute("contenteditable")
@@ -573,8 +571,6 @@ async def scan_candidate_actions(
         input_type = (await handle.get_attribute("type")) or None
         if tag_name == "input":
             input_type = (input_type or "text").lower()
-            if input_type not in allowed_input_types:
-                return None, None
 
         if tag_name not in {"input", "textarea"} and contenteditable_attr is None and (role or "").lower() != "textbox":
             return None, None
@@ -702,11 +698,12 @@ async def scan_candidate_actions(
                 )
                 return
             handle = type_locator.nth(i)
+            visible = False
+            visibility_error = None
             try:
                 visible = await handle.is_visible()
             except Exception as exc:
-                logging.debug("type_scan[%s]: is_visible error=%r", i, exc)
-                visible = False
+                visibility_error = exc
 
             try:
                 attrs = await handle.evaluate(
@@ -723,6 +720,13 @@ async def scan_candidate_actions(
                 logging.debug("type_scan[%s]: attr eval error=%r", i, exc)
                 attrs = {}
 
+            logging.debug("type_scan[%s]: attrs_snapshot=%s", i, attrs)
+
+            if visibility_error:
+                logging.debug("type_scan[%s]: is_visible raised error=%r", i, visibility_error)
+            else:
+                logging.debug("type_scan[%s]: is_visible ok=%s", i, visible)
+
             logging.debug(
                 "type_scan[%s]: visible=%s attrs=%s",
                 i,
@@ -730,12 +734,12 @@ async def scan_candidate_actions(
                 attrs,
             )
 
-            if not visible:
-                logging.debug("type_scan[%s]: skip_not_visible", i)
-                continue
-
             element_uid, candidate = await make_type_candidate_from_locator(handle, i, type_index)
-            if not candidate:
+            if candidate:
+                logging.debug(
+                    "type_scan[%s]: make_type_candidate returned id=%s desc=%s", i, candidate.id, candidate.description
+                )
+            else:
                 logging.debug("type_scan[%s]: make_type_candidate returned None", i)
                 continue
 
