@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
+import logging
 from typing import Callable
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -138,6 +139,12 @@ async def run_agent_loop(
         )
         candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
         type_ids = [c.id for c in candidates if c.is_type_target]
+        logging.debug(
+            "agent_loop step=%s type_ids=%s sample=%s",
+            0,
+            len(type_ids),
+            type_ids[:5],
+        )
         active_snapshot = snapshot
         if not candidates:
             flow.status = "no_actions"
@@ -184,6 +191,12 @@ async def run_agent_loop(
                 )
                 candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
                 type_ids = [c.id for c in candidates if c.is_type_target]
+                logging.debug(
+                    "agent_loop step=%s type_ids=%s sample=%s",
+                    step_index,
+                    len(type_ids),
+                    type_ids[:5],
+                )
 
             if not candidates:
                 capture_manager.finish_flow(flow, status="no_actions")

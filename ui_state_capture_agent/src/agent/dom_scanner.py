@@ -4,13 +4,15 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Set, Tuple
+from typing import List, Literal, Optional, Set, Tuple, Union
 
-from playwright.async_api import Page
+from playwright.async_api import Frame, Page
 
 from .page_snapshot import AXNode, PageSnapshot, SnapshotNode
 
 ActionType = Literal["click", "type"]
+
+DomContext = Union[Page, Frame]
 
 
 @dataclass
@@ -315,39 +317,30 @@ async def scan_candidate_actions(
         except Exception:
             return None
 
-    async def get_xpath(handle) -> Optional[str]:
+    async def compute_xpath(handle, context: DomContext) -> Optional[str]:
         try:
             return await handle.evaluate(
                 """
                 (el) => {
                     function getXPath(node) {
-                        if (node.nodeType !== Node.ELEMENT_NODE) return "";
-                        if (node.id) {
-                            return 'id("' + node.id + '")';
+                        if (!node || node.nodeType !== Node.ELEMENT_NODE) return "";
+                        if (!node.parentElement) {
+                            return '/' + (node.tagName || '').toLowerCase();
                         }
-                        const parts = [];
-                        while (node && node.nodeType === Node.ELEMENT_NODE) {
-                            let index = 1;
-                            let sibling = node.previousSibling;
-                            while (sibling) {
-                                if (sibling.nodeType === Node.ELEMENT_NODE &&
-                                    sibling.nodeName === node.nodeName) {
-                                    index += 1;
-                                }
-                                sibling = sibling.previousSibling;
-                            }
-                            const tagName = node.nodeName.toLowerCase();
-                            const part = index > 1 ? `${tagName}[${index}]` : tagName;
-                            parts.unshift(part);
-                            node = node.parentNode;
-                        }
-                        return "/" + parts.join("/");
+                        const parent = node.parentElement;
+                        const siblings = Array.from(parent.children).filter(
+                            (c) => c.tagName === node.tagName
+                        );
+                        const index = siblings.indexOf(node) + 1;
+                        const tag = (node.tagName || '').toLowerCase();
+                        return getXPath(parent) + '/' + tag + '[' + index + ']';
                     }
                     return getXPath(el);
                 }
                 """
             )
-        except Exception:
+        except Exception as exc:
+            logging.debug("compute_xpath: failed %r", exc)
             return None
 
     async def collect_ancestor_text(handle) -> str:
@@ -377,7 +370,7 @@ async def scan_candidate_actions(
         joined = " | ".join(texts)
         return trim_text(joined, limit=200) or ""
 
-    async def resolve_labelledby_text(handle) -> Optional[str]:
+    async def resolve_labelledby_text(handle, context: DomContext) -> Optional[str]:
         try:
             aria_labelledby = (await handle.get_attribute("aria-labelledby")) or ""
         except Exception:
@@ -385,7 +378,7 @@ async def scan_candidate_actions(
         labelledby_text = ""
         if aria_labelledby:
             for ref_id in aria_labelledby.split():
-                ref_locator = page.locator(f"#{ref_id}")
+                ref_locator = context.locator(f"#{ref_id}")
                 try:
                     if await ref_locator.count() > 0:
                         labelledby_text = trim_text(await ref_locator.first.inner_text(), limit=120) or ""
@@ -522,94 +515,114 @@ async def scan_candidate_actions(
 
     seen_elements: Set[str] = set()
 
+    contexts: List[DomContext] = [page] + [frame for frame in page.frames if frame != page.main_frame]
+
     # Discover clickable elements.
     clickable_selector = "button, a[href], [role='button'], [role='link'], [onclick], [tabindex]:not([tabindex='-1'])"
-    clickable_locator = page.locator(clickable_selector)
-    click_count = await clickable_locator.count()
-    for i in range(click_count):
-        if len(candidates) >= max_actions:
-            return candidates, [c.id for c in candidates if c.is_type_target]
-        handle = clickable_locator.nth(i)
-        if not await is_visible(handle):
-            continue
+    for context in contexts:
+        clickable_locator = context.locator(clickable_selector)
+        click_count = await clickable_locator.count()
+        for i in range(click_count):
+            if len(candidates) >= max_actions:
+                return candidates, [c.id for c in candidates if c.is_type_target]
+            handle = clickable_locator.nth(i)
+            if not await is_visible(handle):
+                continue
 
-        tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
-        role_attr = (await handle.get_attribute("role")) or ""
-        contenteditable_attr = await handle.get_attribute("contenteditable")
+            tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
+            role_attr = (await handle.get_attribute("role")) or ""
+            contenteditable_attr = await handle.get_attribute("contenteditable")
 
-        if tag_name in {"input", "textarea"} or contenteditable_attr or role_attr.lower() == "textbox":
-            continue
+            if tag_name in {"input", "textarea"} or contenteditable_attr or role_attr.lower() == "textbox":
+                continue
 
-        role = role_attr or None
-        aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
-        labelledby_text = await resolve_labelledby_text(handle)
-        aria_label = aria_label_raw or labelledby_text
-        placeholder = trim_text(await handle.get_attribute("placeholder"), limit=120)
-        inner_text = trim_text(await handle.inner_text(), limit=120)
-        visible_text = inner_text or aria_label or ""
-        ancestor_text = await collect_ancestor_text(handle)
-        section_chain = await collect_section_chain(handle)
-        bbox = await get_bounding_box(handle)
-        section_label = infer_section_label(section_chain, bbox)
-        label_text = trim_text(aria_label or visible_text, limit=120)
-        description = (
-            f"{tag_name or 'element'} \"{label_text}\"" if label_text else f"{tag_name or 'element'} index {i}"
-        )
-        semantics = compute_semantics(
-            tag=tag_name,
-            role=role,
-            label=label_text or "",
-            placeholder=placeholder or "",
-            text=inner_text or "",
-            input_type=None,
-        )
-        class_name = section_chain[0].get("className", "") if section_chain else ""
-        is_primary_cta, is_nav_link, is_form_field = compute_flags(
-            tag_name, role, class_name, section_label, False, semantics
-        )
-        goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
-        element_uid = await get_element_uid(handle)
-        if element_uid and element_uid in seen_elements:
-            continue
-        if element_uid:
-            seen_elements.add(element_uid)
-
-        add_candidate(
-            CandidateAction(
-                id=f"btn_{i}" if tag_name != "a" else f"link_{i}",
-                locator=f"{clickable_selector} >> nth={i}",
-                action_type="click",
-                description=description,
+            role = role_attr or None
+            aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
+            labelledby_text = await resolve_labelledby_text(handle, context)
+            aria_label = aria_label_raw or labelledby_text
+            placeholder = trim_text(await handle.get_attribute("placeholder"), limit=120)
+            inner_text = trim_text(await handle.inner_text(), limit=120)
+            visible_text = inner_text or aria_label or ""
+            ancestor_text = await collect_ancestor_text(handle)
+            section_chain = await collect_section_chain(handle)
+            bbox = await get_bounding_box(handle)
+            section_label = infer_section_label(section_chain, bbox)
+            label_text = trim_text(aria_label or visible_text, limit=120)
+            description = (
+                f"{tag_name or 'element'} \"{label_text}\"" if label_text else f"{tag_name or 'element'} index {i}"
+            )
+            semantics = compute_semantics(
                 tag=tag_name,
                 role=role,
-                aria_label=aria_label,
-                type=None,
-                text=visible_text or inner_text,
-                semantics=semantics,
-                bounding_box=bbox,
-                kind="click",
-                visible_text=visible_text,
-                placeholder=placeholder,
-                ancestor_text=ancestor_text,
-                section_label=section_label,
-                is_primary_cta=is_primary_cta,
-                is_nav_link=is_nav_link,
-                is_form_field=is_form_field,
-                goal_match_score=goal_match_score,
+                label=label_text or "",
+                placeholder=placeholder or "",
+                text=inner_text or "",
+                input_type=None,
             )
-        )
+            class_name = section_chain[0].get("className", "") if section_chain else ""
+            is_primary_cta, is_nav_link, is_form_field = compute_flags(
+                tag_name, role, class_name, section_label, False, semantics
+            )
+            goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
+            element_uid = await get_element_uid(handle)
+            if element_uid and element_uid in seen_elements:
+                continue
+            if element_uid:
+                seen_elements.add(element_uid)
+
+            xpath = await compute_xpath(handle, context)
+
+            add_candidate(
+                CandidateAction(
+                    id=f"btn_{i}" if tag_name != "a" else f"link_{i}",
+                    locator=f"{clickable_selector} >> nth={i}",
+                    action_type="click",
+                    description=description,
+                    tag=tag_name,
+                    role=role,
+                    aria_label=aria_label,
+                    type=None,
+                    text=visible_text or inner_text,
+                    semantics=semantics,
+                    bounding_box=bbox,
+                    kind="click",
+                    visible_text=visible_text,
+                    placeholder=placeholder,
+                    ancestor_text=ancestor_text,
+                    section_label=section_label,
+                    is_primary_cta=is_primary_cta,
+                    is_nav_link=is_nav_link,
+                    is_form_field=is_form_field,
+                    goal_match_score=goal_match_score,
+                    xpath=xpath,
+                )
+            )
 
     type_selector = "input, textarea, [contenteditable], [role='textbox']"
-    async def make_type_candidate_from_locator(handle, nth_index: int, type_index: int) -> tuple[Optional[str], Optional[CandidateAction]]:
+    async def make_type_candidate_from_locator(
+        handle,
+        nth_index: int,
+        type_index: int,
+        context: DomContext,
+    ) -> tuple[Optional[str], Optional[CandidateAction]]:
         tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
         contenteditable_attr = await handle.get_attribute("contenteditable")
         role = (await handle.get_attribute("role")) or None
         input_type = (await handle.get_attribute("type")) or None
+
+        role_lower = (role or "").lower()
+        ce_lower = (contenteditable_attr or "").lower() if contenteditable_attr is not None else None
+
         if tag_name == "input":
             input_type = (input_type or "text").lower()
-
-        if tag_name not in {"input", "textarea"} and contenteditable_attr is None and (role or "").lower() != "textbox":
-            return None, None
+            if input_type in {"file", "checkbox", "radio", "submit", "button", "reset", "image"}:
+                return None, None
+        elif tag_name == "textarea":
+            input_type = input_type or None
+        else:
+            is_contenteditable = contenteditable_attr is not None and ce_lower in {"", "true", "plaintext-only"}
+            if not is_contenteditable and role_lower != "textbox":
+                return None, None
 
         aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
         placeholder_value = trim_text(await handle.get_attribute("placeholder"), limit=120)
@@ -617,11 +630,11 @@ async def scan_candidate_actions(
 
         label_text = ""
         if element_id:
-            label_locator = page.locator(f"label[for=\"{element_id}\"]")
+            label_locator = context.locator(f"label[for=\"{element_id}\"]")
             if await label_locator.count() > 0:
                 label_text = trim_text(await label_locator.first.inner_text()) or ""
 
-        labelledby_text = await resolve_labelledby_text(handle)
+        labelledby_text = await resolve_labelledby_text(handle, context)
         aria_label = aria_label_raw or labelledby_text
 
         text_content = trim_text(await handle.inner_text(), limit=120) or ""
@@ -679,7 +692,7 @@ async def scan_candidate_actions(
         desc_hint = primary_hint or placeholder_value or text_content
         description = f"{base_desc} \"{desc_hint}\"" if desc_hint else base_desc
 
-        xpath = await get_xpath(handle)
+        xpath = await compute_xpath(handle, context)
 
         candidate = CandidateAction(
             id=f"input_{type_index}",
@@ -719,34 +732,36 @@ async def scan_candidate_actions(
         return max_index + 1
 
     async def augment_with_type_candidates_from_playwright(start_index: int) -> None:
-        type_locator = page.locator(type_selector)
-        type_count = await type_locator.count()
         type_index = start_index
-        logging.debug(
-            "type_scan step=%s selector=%s count=%s",
-            step_index,
-            type_selector,
-            type_count,
-        )
-        for i in range(type_count):
-            if len(candidates) >= max_actions:
-                logging.debug(
-                    "type_scan abort: max_actions reached step=%s len=%s",
-                    step_index,
-                    len(candidates),
-                )
-                return
-            handle = type_locator.nth(i)
-            visible = False
-            visibility_error = None
-            try:
-                visible = await handle.is_visible()
-            except Exception as exc:
-                visibility_error = exc
+        for ctx_idx, context in enumerate(contexts):
+            type_locator = context.locator(type_selector)
+            type_count = await type_locator.count()
+            logging.debug(
+                "type_scan step=%s ctx=%s selector=%s count=%s",
+                step_index,
+                ctx_idx,
+                type_selector,
+                type_count,
+            )
+            for i in range(type_count):
+                if len(candidates) >= max_actions:
+                    logging.debug(
+                        "type_scan abort: max_actions reached step=%s len=%s",
+                        step_index,
+                        len(candidates),
+                    )
+                    return
+                handle = type_locator.nth(i)
+                visible = False
+                visibility_error = None
+                try:
+                    visible = await handle.is_visible()
+                except Exception as exc:
+                    visibility_error = exc
 
-            try:
-                attrs = await handle.evaluate(
-                    """(el) => ({
+                try:
+                    attrs = await handle.evaluate(
+                        """(el) => ({
             tag: el.tagName && el.tagName.toLowerCase(),
             role: el.getAttribute('role'),
             ce: el.getAttribute('contenteditable'),
@@ -754,48 +769,64 @@ async def scan_candidate_actions(
             classes: el.className,
             text: el.innerText
         })"""
-                )
-            except Exception as exc:
-                logging.debug("type_scan[%s]: attr eval error=%r", i, exc)
-                attrs = {}
+                    )
+                except Exception as exc:
+                    logging.debug("type_scan[%s,%s]: attr eval error=%r", ctx_idx, i, exc)
+                    attrs = {}
 
-            logging.debug("type_scan[%s]: attrs_snapshot=%s", i, attrs)
+                if visibility_error:
+                    logging.debug("type_scan[%s,%s]: is_visible raised error=%r", ctx_idx, i, visibility_error)
+                else:
+                    logging.debug("type_scan[%s,%s]: is_visible ok=%s", ctx_idx, i, visible)
 
-            if visibility_error:
-                logging.debug("type_scan[%s]: is_visible raised error=%r", i, visibility_error)
-            else:
-                logging.debug("type_scan[%s]: is_visible ok=%s", i, visible)
+                element_uid, candidate = await make_type_candidate_from_locator(handle, i, type_index, context)
+                xpath_log = candidate.xpath if candidate else None
+                if candidate:
+                    logging.debug(
+                        "type_scan[%s,%s]: visible=%s tag=%s role=%s ce=%s type=%s text=%.40r xpath=%s",
+                        ctx_idx,
+                        i,
+                        visible,
+                        attrs.get("tag"),
+                        attrs.get("role"),
+                        attrs.get("ce"),
+                        attrs.get("type"),
+                        (attrs.get("text") or "")[:40],
+                        xpath_log,
+                    )
+                    logging.debug(
+                        "type_scan[%s,%s]: make_type_candidate returned id=%s desc=%s",
+                        ctx_idx,
+                        i,
+                        candidate.id,
+                        candidate.description,
+                    )
+                else:
+                    logging.debug(
+                        "type_scan[%s,%s]: make_type_candidate returned None attrs=%s visible=%s",
+                        ctx_idx,
+                        i,
+                        attrs,
+                        visible,
+                    )
+                    continue
 
-            logging.debug(
-                "type_scan[%s]: visible=%s attrs=%s",
-                i,
-                visible,
-                attrs,
-            )
+                if element_uid and element_uid in seen_elements:
+                    logging.debug("type_scan[%s,%s]: skip_seen uid=%s", ctx_idx, i, element_uid)
+                    continue
 
-            element_uid, candidate = await make_type_candidate_from_locator(handle, i, type_index)
-            if candidate:
+                add_candidate(candidate)
+                if element_uid:
+                    seen_elements.add(element_uid)
                 logging.debug(
-                    "type_scan[%s]: make_type_candidate returned id=%s desc=%s", i, candidate.id, candidate.description
+                    "type_scan[%s,%s]: added_type_candidate id=%s desc=%s xpath=%s",
+                    ctx_idx,
+                    i,
+                    candidate.id,
+                    candidate.description,
+                    candidate.xpath,
                 )
-            else:
-                logging.debug("type_scan[%s]: make_type_candidate returned None", i)
-                continue
-
-            if element_uid and element_uid in seen_elements:
-                logging.debug("type_scan[%s]: skip_seen uid=%s", i, element_uid)
-                continue
-
-            add_candidate(candidate)
-            if element_uid:
-                seen_elements.add(element_uid)
-            logging.debug(
-                "type_scan[%s]: added_type_candidate id=%s desc=%s",
-                i,
-                candidate.id,
-                candidate.description,
-            )
-            type_index += 1
+                type_index += 1
 
         logging.debug(
             "type_scan done step=%s total_type_candidates=%s",
@@ -804,141 +835,143 @@ async def scan_candidate_actions(
         )
 
     async def augment_with_type_candidates_from_xpath(start_index: int) -> None:
-        try:
-            nodes = await page.evaluate(
-                """
-                () => {
-                    function getXPath(node) {
-                        if (node.nodeType !== Node.ELEMENT_NODE) return "";
-                        if (node.id) {
-                            return 'id("' + node.id + '")';
-                        }
-                        const parts = [];
-                        while (node && node.nodeType === Node.ELEMENT_NODE) {
-                            let index = 1;
-                            let sibling = node.previousSibling;
-                            while (sibling) {
-                                if (sibling.nodeType === Node.ELEMENT_NODE &&
-                                    sibling.nodeName === node.nodeName) {
-                                    index += 1;
-                                }
-                                sibling = sibling.previousSibling;
-                            }
-                            const tagName = node.nodeName.toLowerCase();
-                            const part = index > 1 ? `${tagName}[${index}]` : tagName;
-                            parts.unshift(part);
-                            node = node.parentNode;
-                        }
-                        return "/" + parts.join("/");
-                    }
-
-                    const selector = 'input, textarea, [contenteditable], [role="textbox"]';
-                    const els = Array.from(document.querySelectorAll(selector));
-                    return els.map((el) => {
-                        const tag = el.tagName ? el.tagName.toLowerCase() : "";
-                        const placeholder = el.getAttribute("placeholder") || "";
-                        const aria = el.getAttribute("aria-label") || "";
-                        const text = (el.innerText || el.value || "").trim();
-                        return {
-                            xpath: getXPath(el),
-                            tag,
-                            placeholder,
-                            aria,
-                            text,
-                        };
-                    });
-                }
-                """
-            )
-        except Exception as exc:
-            logging.debug("xpath_type_scan: eval_failed step=%s error=%r", step_index, exc)
-            return
-
-        if not nodes:
-            logging.debug("xpath_type_scan: no_nodes step=%s", step_index)
-            return
-
-        logging.debug("xpath_type_scan: step=%s count=%s", step_index, len(nodes))
-
         type_index = start_index
-        for idx, node in enumerate(nodes):
-            if len(candidates) >= max_actions:
-                logging.debug(
-                    "xpath_type_scan abort: max_actions reached step=%s len=%s",
-                    step_index,
-                    len(candidates),
+        for ctx_idx, context in enumerate(contexts):
+            try:
+                nodes = await context.evaluate(
+                    """
+                    () => {
+                        function getXPath(node) {
+                            if (node.nodeType !== Node.ELEMENT_NODE) return "";
+                            if (node.id) {
+                                return 'id("' + node.id + '")';
+                            }
+                            const parts = [];
+                            while (node && node.nodeType === Node.ELEMENT_NODE) {
+                                let index = 1;
+                                let sibling = node.previousSibling;
+                                while (sibling) {
+                                    if (sibling.nodeType === Node.ELEMENT_NODE &&
+                                        sibling.nodeName === node.nodeName) {
+                                        index += 1;
+                                    }
+                                    sibling = sibling.previousSibling;
+                                }
+                                const tagName = node.nodeName.toLowerCase();
+                                const part = index > 1 ? `${tagName}[${index}]` : tagName;
+                                parts.unshift(part);
+                                node = node.parentNode;
+                            }
+                            return "/" + parts.join("/");
+                        }
+
+                        const selector = 'input, textarea, [contenteditable], [role="textbox"]';
+                        const els = Array.from(document.querySelectorAll(selector));
+                        return els.map((el) => {
+                            const tag = el.tagName ? el.tagName.toLowerCase() : "";
+                            const placeholder = el.getAttribute("placeholder") || "";
+                            const aria = el.getAttribute("aria-label") || "";
+                            const text = (el.innerText || el.value || "").trim();
+                            return {
+                                xpath: getXPath(el),
+                                tag,
+                                placeholder,
+                                aria,
+                                text,
+                            };
+                        });
+                    }
+                    """
                 )
-                return
-
-            xpath = node.get("xpath") or None
-            if not xpath:
+            except Exception as exc:
+                logging.debug("xpath_type_scan: eval_failed step=%s ctx=%s error=%r", step_index, ctx_idx, exc)
                 continue
 
-            if any(c.xpath == xpath for c in candidates if c.xpath):
+            if not nodes:
+                logging.debug("xpath_type_scan: no_nodes step=%s ctx=%s", step_index, ctx_idx)
                 continue
 
-            tag = node.get("tag") or ""
-            placeholder = node.get("placeholder") or ""
-            aria = node.get("aria") or ""
-            text = node.get("text") or ""
-            visible_text = aria or placeholder or text
+            logging.debug("xpath_type_scan: step=%s ctx=%s count=%s", step_index, ctx_idx, len(nodes))
 
-            semantics = compute_semantics(
-                tag=tag,
-                role=None,
-                label=visible_text,
-                placeholder=placeholder,
-                text=text,
-                input_type=None,
-            )
+            for idx, node in enumerate(nodes):
+                if len(candidates) >= max_actions:
+                    logging.debug(
+                        "xpath_type_scan abort: max_actions reached step=%s len=%s",
+                        step_index,
+                        len(candidates),
+                    )
+                    return
 
-            ancestor_text = ""
-            section_label = None
-            is_primary_cta = False
-            is_nav_link = False
-            is_form_field = True
+                xpath = node.get("xpath") or None
+                if not xpath:
+                    continue
 
-            goal_match_score = compute_goal_score(visible_text)
-            if goal_has_concrete_name and _has_text_field_keyword(visible_text):
-                goal_match_score += 1.0
+                if any(c.xpath == xpath for c in candidates if c.xpath):
+                    continue
 
-            description = f"xpath text entry \"{visible_text[:40]}\"" if visible_text else "xpath text entry"
+                tag = node.get("tag") or ""
+                placeholder = node.get("placeholder") or ""
+                aria = node.get("aria") or ""
+                text = node.get("text") or ""
+                visible_text = aria or placeholder or text
 
-            cand = CandidateAction(
-                id=f"xpath_input_{type_index}",
-                locator=f"xpath={xpath}",
-                action_type="type",
-                description=description,
-                tag=tag,
-                role=None,
-                aria_label=aria,
-                type=None,
-                text=visible_text,
-                semantics=semantics,
-                bounding_box=None,
-                kind="type",
-                visible_text=visible_text,
-                placeholder=placeholder,
-                ancestor_text=ancestor_text,
-                section_label=section_label,
-                is_primary_cta=is_primary_cta,
-                is_nav_link=is_nav_link,
-                is_form_field=is_form_field,
-                is_type_target=True,
-                goal_match_score=goal_match_score,
-                source_hint="xpath_scan",
-                xpath=xpath,
-            )
+                semantics = compute_semantics(
+                    tag=tag,
+                    role=None,
+                    label=visible_text,
+                    placeholder=placeholder,
+                    text=text,
+                    input_type=None,
+                )
 
-            add_candidate(cand)
-            logging.debug(
-                "xpath_type_scan[%s]: added_type_candidate id=%s xpath=%s desc=%s",
-                idx,
-                cand.id,
-                xpath,
-                description,
-            )
-            type_index += 1
+                ancestor_text = ""
+                section_label = None
+                is_primary_cta = False
+                is_nav_link = False
+                is_form_field = True
+
+                goal_match_score = compute_goal_score(visible_text)
+                if goal_has_concrete_name and _has_text_field_keyword(visible_text):
+                    goal_match_score += 1.0
+
+                description = f"xpath text entry \"{visible_text[:40]}\"" if visible_text else "xpath text entry"
+
+                cand = CandidateAction(
+                    id=f"xpath_input_{type_index}",
+                    locator=f"xpath={xpath}",
+                    action_type="type",
+                    description=description,
+                    tag=tag,
+                    role=None,
+                    aria_label=aria,
+                    type=None,
+                    text=visible_text,
+                    semantics=semantics,
+                    bounding_box=None,
+                    kind="type",
+                    visible_text=visible_text,
+                    placeholder=placeholder,
+                    ancestor_text=ancestor_text,
+                    section_label=section_label,
+                    is_primary_cta=is_primary_cta,
+                    is_nav_link=is_nav_link,
+                    is_form_field=is_form_field,
+                    is_type_target=True,
+                    goal_match_score=goal_match_score,
+                    source_hint="xpath_scan",
+                    xpath=xpath,
+                )
+
+                add_candidate(cand)
+                logging.debug(
+                    "xpath_type_scan[%s:%s]: added_type_candidate id=%s xpath=%s desc=%s",
+                    ctx_idx,
+                    idx,
+                    cand.id,
+                    xpath,
+                    description,
+                )
+                type_index += 1
 
         logging.debug(
             "xpath_type_scan done step=%s total_xpath_type_candidates=%s",
@@ -960,6 +993,7 @@ async def scan_candidate_actions(
             "id": cand.id,
             "kind": cand.kind,
             "text": (cand.visible_text or cand.description or "")[:80],
+            "xpath": cand.xpath,
         }
         for cand in live_type_candidates[:5]
     ]

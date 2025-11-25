@@ -29,6 +29,15 @@ class FakeHandle:
         return True
 
     async def evaluate(self, script):
+        if "contenteditable" in script and "classes" in script:
+            return {
+                "tag": self.tag_name,
+                "role": self.attributes.get("role"),
+                "ce": self.attributes.get("contenteditable"),
+                "type": self.attributes.get("type"),
+                "classes": self.attributes.get("class", ""),
+                "text": self.inner_text_value,
+            }
         if "el.tagName" in script:
             return self.tag_name
         if "__softlight_uid" in script:
@@ -79,6 +88,10 @@ class FakeLocatorMultiple:
 class FakePage:
     viewport_size = {"width": 0, "height": 0}
 
+    def __init__(self, frames: list | None = None):
+        self.frames = frames or []
+        self.main_frame = self
+
     def locator(self, _selector):
         return FakeLocator()
 
@@ -89,8 +102,8 @@ class FakePage:
 
 
 class FakePageLive(FakePage):
-    def __init__(self, handles: list[FakeHandle]):
-        super().__init__()
+    def __init__(self, handles: list[FakeHandle], frames: list | None = None):
+        super().__init__(frames=frames)
         self.handles = handles
 
     def locator(self, selector):
@@ -120,6 +133,12 @@ class FakePageLive(FakePage):
                 )
             return nodes
         return await super().evaluate(script)
+
+
+class FakeFrame(FakePageLive):
+    def __init__(self, handles: list[FakeHandle]):
+        super().__init__(handles=handles, frames=[])
+        self.main_frame = self
 
 
 def test_contenteditable_field_is_type_candidate():
@@ -204,3 +223,26 @@ def test_live_page_multiple_inputs_sets_type_ids_and_logs(caplog):
 
     log_messages = [record.message for record in caplog.records if "live_type_targets" in record.message]
     assert any("count=2" in message or "count=1" in message for message in log_messages)
+
+
+def test_frame_contenteditable_type_candidates_have_xpath():
+    frame_handle = FakeHandle(
+        tag_name="div",
+        attributes={"contenteditable": "true", "role": "textbox", "aria-label": "Frame Title"},
+        inner_text="",
+        uid="uid-frame",
+    )
+    frame = FakeFrame([frame_handle])
+    page = FakePageLive(handles=[], frames=[frame])
+
+    candidates, type_ids = asyncio.run(
+        scan_candidate_actions(
+            page=page,
+            snapshot=None,
+            goal="Create page",
+        )
+    )
+
+    type_candidates = [c for c in candidates if getattr(c, "is_type_target", False)]
+    assert any(c.id in type_ids for c in type_candidates), "type_ids should include frame targets"
+    assert any(c.xpath for c in type_candidates), "expected xpath to be populated for frame candidates"
