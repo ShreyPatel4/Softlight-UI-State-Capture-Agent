@@ -134,15 +134,17 @@ async def run_agent_loop(
 
         log_flow_event(session, flow, "info", "Captured initial_state")
 
+        current_url = page.url
         candidates, type_ids = await scan_candidate_actions(
             page, max_actions=40, goal=task.goal, snapshot=snapshot, step_index=0
         )
         candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
         type_ids = [c.id for c in candidates if c.is_type_target]
         logging.debug(
-            "agent_loop step=%s type_ids=%s sample=%s",
+            "agent_loop step=%s url=%s candidate_count=%s type_ids_sample=%s",
             0,
-            len(type_ids),
+            current_url,
+            len(candidates),
             type_ids[:5],
         )
         active_snapshot = snapshot
@@ -182,6 +184,7 @@ async def run_agent_loop(
                             ax=len(active_snapshot.ax_nodes),
                         ),
                     )
+                current_url = page.url
                 candidates, type_ids = await scan_candidate_actions(
                     page,
                     max_actions=40,
@@ -192,9 +195,10 @@ async def run_agent_loop(
                 candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
                 type_ids = [c.id for c in candidates if c.is_type_target]
                 logging.debug(
-                    "agent_loop step=%s type_ids=%s sample=%s",
+                    "agent_loop step=%s url=%s candidate_count=%s type_ids_sample=%s",
                     step_index,
-                    len(type_ids),
+                    current_url,
+                    len(candidates),
                     type_ids[:5],
                 )
 

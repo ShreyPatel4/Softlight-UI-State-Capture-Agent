@@ -227,6 +227,10 @@ async def scan_candidate_actions(
     candidates: List[CandidateAction] = []
     candidate_ids: Set[str] = set()
     candidate_by_id: dict[str, CandidateAction] = {}
+
+    # Allow the scan to collect more than max_actions, then prune later.
+    # This avoids starving type targets when pages have lots of buttons.
+    soft_limit = max_actions * 2
     goal_tokens: Set[str] = _prepare_goal_tokens(goal)
     goal_has_concrete_name = _goal_contains_concrete_name(goal)
 
@@ -235,7 +239,7 @@ async def scan_candidate_actions(
         if existing:
             existing.is_type_target = existing.is_type_target or cand.is_type_target
             return
-        if len(candidates) >= max_actions:
+        if len(candidates) >= soft_limit:
             return
         candidates.append(cand)
         candidate_ids.add(cand.id)
@@ -370,7 +374,7 @@ async def scan_candidate_actions(
         joined = " | ".join(texts)
         return trim_text(joined, limit=200) or ""
 
-    async def resolve_labelledby_text(handle, context: DomContext) -> Optional[str]:
+    async def resolve_labelledby_text(context, handle) -> Optional[str]:
         try:
             aria_labelledby = (await handle.get_attribute("aria-labelledby")) or ""
         except Exception:
@@ -523,8 +527,8 @@ async def scan_candidate_actions(
         clickable_locator = context.locator(clickable_selector)
         click_count = await clickable_locator.count()
         for i in range(click_count):
-            if len(candidates) >= max_actions:
-                return candidates, [c.id for c in candidates if c.is_type_target]
+            if len(candidates) >= soft_limit:
+                break
             handle = clickable_locator.nth(i)
             if not await is_visible(handle):
                 continue
@@ -538,7 +542,7 @@ async def scan_candidate_actions(
 
             role = role_attr or None
             aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
-            labelledby_text = await resolve_labelledby_text(handle, context)
+            labelledby_text = await resolve_labelledby_text(context, handle)
             aria_label = aria_label_raw or labelledby_text
             placeholder = trim_text(await handle.get_attribute("placeholder"), limit=120)
             inner_text = trim_text(await handle.inner_text(), limit=120)
@@ -600,10 +604,10 @@ async def scan_candidate_actions(
 
     type_selector = "input, textarea, [contenteditable], [role='textbox']"
     async def make_type_candidate_from_locator(
+        context,
         handle,
         nth_index: int,
         type_index: int,
-        context: DomContext,
     ) -> tuple[Optional[str], Optional[CandidateAction]]:
         tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
         contenteditable_attr = await handle.get_attribute("contenteditable")
@@ -634,7 +638,7 @@ async def scan_candidate_actions(
             if await label_locator.count() > 0:
                 label_text = trim_text(await label_locator.first.inner_text()) or ""
 
-        labelledby_text = await resolve_labelledby_text(handle, context)
+        labelledby_text = await resolve_labelledby_text(context, handle)
         aria_label = aria_label_raw or labelledby_text
 
         text_content = trim_text(await handle.inner_text(), limit=120) or ""
@@ -732,107 +736,36 @@ async def scan_candidate_actions(
         return max_index + 1
 
     async def augment_with_type_candidates_from_playwright(start_index: int) -> None:
+        # Scan type like fields in the main page and all child frames.
+        contexts = [page] + list(page.frames)
         type_index = start_index
-        for ctx_idx, context in enumerate(contexts):
-            type_locator = context.locator(type_selector)
+
+        for ctx in contexts:
+            type_locator = ctx.locator(type_selector)
             type_count = await type_locator.count()
-            logging.debug(
-                "type_scan step=%s ctx=%s selector=%s count=%s",
-                step_index,
-                ctx_idx,
-                type_selector,
-                type_count,
-            )
+
             for i in range(type_count):
-                if len(candidates) >= max_actions:
-                    logging.debug(
-                        "type_scan abort: max_actions reached step=%s len=%s",
-                        step_index,
-                        len(candidates),
-                    )
+                if len(candidates) >= soft_limit:
                     return
+
                 handle = type_locator.nth(i)
-                visible = False
-                visibility_error = None
-                try:
-                    visible = await handle.is_visible()
-                except Exception as exc:
-                    visibility_error = exc
+                if not await is_visible(handle):
+                    continue
 
-                try:
-                    attrs = await handle.evaluate(
-                        """(el) => ({
-            tag: el.tagName && el.tagName.toLowerCase(),
-            role: el.getAttribute('role'),
-            ce: el.getAttribute('contenteditable'),
-            type: el.getAttribute('type'),
-            classes: el.className,
-            text: el.innerText
-        })"""
-                    )
-                except Exception as exc:
-                    logging.debug("type_scan[%s,%s]: attr eval error=%r", ctx_idx, i, exc)
-                    attrs = {}
-
-                if visibility_error:
-                    logging.debug("type_scan[%s,%s]: is_visible raised error=%r", ctx_idx, i, visibility_error)
-                else:
-                    logging.debug("type_scan[%s,%s]: is_visible ok=%s", ctx_idx, i, visible)
-
-                element_uid, candidate = await make_type_candidate_from_locator(handle, i, type_index, context)
-                xpath_log = candidate.xpath if candidate else None
-                if candidate:
-                    logging.debug(
-                        "type_scan[%s,%s]: visible=%s tag=%s role=%s ce=%s type=%s text=%.40r xpath=%s",
-                        ctx_idx,
-                        i,
-                        visible,
-                        attrs.get("tag"),
-                        attrs.get("role"),
-                        attrs.get("ce"),
-                        attrs.get("type"),
-                        (attrs.get("text") or "")[:40],
-                        xpath_log,
-                    )
-                    logging.debug(
-                        "type_scan[%s,%s]: make_type_candidate returned id=%s desc=%s",
-                        ctx_idx,
-                        i,
-                        candidate.id,
-                        candidate.description,
-                    )
-                else:
-                    logging.debug(
-                        "type_scan[%s,%s]: make_type_candidate returned None attrs=%s visible=%s",
-                        ctx_idx,
-                        i,
-                        attrs,
-                        visible,
-                    )
+                element_uid, candidate = await make_type_candidate_from_locator(
+                    ctx, handle, i, type_index
+                )
+                if not candidate:
                     continue
 
                 if element_uid and element_uid in seen_elements:
-                    logging.debug("type_scan[%s,%s]: skip_seen uid=%s", ctx_idx, i, element_uid)
                     continue
 
                 add_candidate(candidate)
                 if element_uid:
                     seen_elements.add(element_uid)
-                logging.debug(
-                    "type_scan[%s,%s]: added_type_candidate id=%s desc=%s xpath=%s",
-                    ctx_idx,
-                    i,
-                    candidate.id,
-                    candidate.description,
-                    candidate.xpath,
-                )
-                type_index += 1
 
-        logging.debug(
-            "type_scan done step=%s total_type_candidates=%s",
-            step_index,
-            len([c for c in candidates if c.is_type_target]),
-        )
+                type_index += 1
 
     async def augment_with_type_candidates_from_xpath(start_index: int) -> None:
         type_index = start_index
@@ -993,7 +926,6 @@ async def scan_candidate_actions(
             "id": cand.id,
             "kind": cand.kind,
             "text": (cand.visible_text or cand.description or "")[:80],
-            "xpath": cand.xpath,
         }
         for cand in live_type_candidates[:5]
     ]
@@ -1002,6 +934,38 @@ async def scan_candidate_actions(
         len(live_type_candidates),
         sample_entries,
     )
+
+    # Hard cap total actions, but never starve type targets.
+    if len(candidates) > max_actions:
+        type_candidates = [c for c in candidates if c.is_type_target]
+        other_candidates = [c for c in candidates if not c.is_type_target]
+
+        # Keep at most half the budget for type fields, but at least one if any exist.
+        max_type_keep = min(len(type_candidates), max(1, max_actions // 2)) if type_candidates else 0
+
+        # Prefer fields that look like title or name, then by goal match.
+        type_candidates_sorted = sorted(
+            type_candidates,
+            key=lambda c: (
+                1 if "title_field" in (c.semantics or set()) else 0,
+                c.goal_match_score,
+            ),
+            reverse=True,
+        )
+        kept_types = type_candidates_sorted[:max_type_keep]
+
+        remaining_slots = max_actions - len(kept_types)
+        other_candidates_sorted = sorted(
+            other_candidates,
+            key=lambda c: (
+                1 if c.is_primary_cta else 0,
+                c.goal_match_score,
+            ),
+            reverse=True,
+        )
+        kept_others = other_candidates_sorted[: max(0, remaining_slots)]
+
+        candidates = kept_types + kept_others
 
     type_ids = [c.id for c in candidates if c.is_type_target]
     return candidates, type_ids
