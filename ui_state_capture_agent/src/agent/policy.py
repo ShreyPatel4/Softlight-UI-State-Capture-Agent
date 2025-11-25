@@ -196,6 +196,7 @@ def _validate_and_normalize_decision(
     step_index: int | None,
 ) -> PolicyDecision:
     candidate_ids = {c.id for c in candidates}
+    candidates_by_id = {c.id: c for c in candidates}
 
     action_id = obj.get("action_id")
     if action_id is None and "id" in obj:
@@ -252,7 +253,7 @@ def _validate_and_normalize_decision(
 
     if action_type == "type":
         if not text_to_type or str(text_to_type).strip() == "":
-            log("warning", f"policy_type_missing_text step={step_index}")
+            log("warning", f"policy_invalid_type_text step={step_index} reason=empty_text")
             return PolicyDecision(
                 action_id=None,
                 action_type="click",
@@ -260,6 +261,30 @@ def _validate_and_normalize_decision(
                 capture=True,
                 done=True,
                 notes="fallback_type_missing_text",
+            )
+
+        candidate = candidates_by_id.get(action_id)
+        supports_type = bool(
+            candidate
+            and (
+                candidate.is_form_field
+                or (candidate.kind or "").lower() == "type"
+                or candidate.action_type == "type"
+            )
+        )
+        if candidate is None or not supports_type:
+            reason = "unknown_action_id" if candidate is None else "target_not_form_field"
+            log(
+                "warning",
+                f"policy_invalid_type_target step={step_index} reason={reason} id={action_id}",
+            )
+            return PolicyDecision(
+                action_id=None,
+                action_type="click",
+                text_to_type=None,
+                capture=True,
+                done=True,
+                notes="fallback_type_invalid_target",
             )
 
     return PolicyDecision(

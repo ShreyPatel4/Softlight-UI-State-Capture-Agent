@@ -123,7 +123,7 @@ async def run_agent_loop(
 
         candidates, type_ids = await scan_candidate_actions(page, max_actions=40, goal=task.goal)
         candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
-        type_ids = [c.id for c in candidates if c.action_type == "type"]
+        type_ids = [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
         if not candidates:
             flow.status = "no_actions"
             flow.status_reason = "no_candidates"
@@ -150,7 +150,7 @@ async def run_agent_loop(
             if step_index != 1:
                 candidates, type_ids = await scan_candidate_actions(page, max_actions=40, goal=task.goal)
                 candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
-                type_ids = [c.id for c in candidates if c.action_type == "type"]
+                type_ids = [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
 
             if not candidates:
                 capture_manager.finish_flow(flow, status="no_actions")
@@ -242,6 +242,7 @@ async def run_agent_loop(
                         continue
                     await locator.click(timeout=2000)
                 elif decision.action_type == "type":
+                    type_failed = False
                     try:
                         locator_count = await locator.count()
                     except Exception:
@@ -288,6 +289,7 @@ async def run_agent_loop(
                             "LLM did not provide text_to_type for type action; skipping",
                         )
                         failure_counts[_candidate_key(selected_candidate)] += 1
+                        type_failed = True
                         continue
                     typed_value = decision.text_to_type
                     logged_value = typed_value if len(typed_value) <= 120 else typed_value[:117] + "..."
@@ -349,6 +351,7 @@ async def run_agent_loop(
                                     "warning",
                                     f"Banned {selected_candidate.id} after repeated timeouts",
                                 )
+                            type_failed = True
                             continue
                         except Exception as exc:
                             log_flow_event(
@@ -357,6 +360,7 @@ async def run_agent_loop(
                                 "warning",
                                 f"Fallback type failed for {selected_candidate.id}: {exc}",
                             )
+                            type_failed = True
                             continue
                     except Exception as exc:
                         log_flow_event(
@@ -366,6 +370,7 @@ async def run_agent_loop(
                             f"Typing failed for {selected_candidate.id}: {exc}",
                         )
                         failure_counts[_candidate_key(selected_candidate)] += 1
+                        type_failed = True
                         continue
             except PlaywrightTimeoutError:
                 key = _candidate_key(selected_candidate)
@@ -389,6 +394,17 @@ async def run_agent_loop(
                         session, flow, "warning", f"Banned {selected_candidate.id} after repeated failures"
                     )
                 continue
+
+            if decision.action_type == "type" and type_failed:
+                flow.status_reason = "type_execution_failed"
+                capture_manager.finish_flow(flow, status="finished")
+                log_flow_event(
+                    session,
+                    flow,
+                    "warning",
+                    f"type_execution_failed step={step_index} action_id={decision.action_id}",
+                )
+                break
 
             await page.wait_for_timeout(800)
 

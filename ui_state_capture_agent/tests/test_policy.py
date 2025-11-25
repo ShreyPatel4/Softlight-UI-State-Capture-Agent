@@ -72,7 +72,15 @@ def test_choose_action_valid_json():
 
 
 def test_choose_action_with_text_to_type():
-    candidates = [CandidateAction(id="input_1", action_type="type", locator="locator", description="Text input labeled 'Title'")]
+    candidates = [
+        CandidateAction(
+            id="input_1",
+            action_type="type",
+            locator="locator",
+            description="Text input labeled 'Title'",
+            is_form_field=True,
+        )
+    ]
     llm = DummyLLM('{"action_id": "input_1", "action_type": "type", "text_to_type": "Some value", "done": false}')
     task = TaskSpec(original_query="", app_name="linear", goal="go", start_url="http://example.com")
 
@@ -89,7 +97,15 @@ def test_choose_action_with_text_to_type():
 
 
 def test_choose_action_logs_decision_with_text():
-    candidates = [CandidateAction(id="input_1", action_type="type", locator="locator", description="type issue title")]
+    candidates = [
+        CandidateAction(
+            id="input_1",
+            action_type="type",
+            locator="locator",
+            description="type issue title",
+            is_form_field=True,
+        )
+    ]
     llm = DummyLLM('{"action_id": "input_1", "action_type": "type", "text_to_type": "Title here", "done": false}')
     task = TaskSpec(original_query="", app_name="linear", goal="create issue named 'Title here'", start_url="http://example.com")
     flow = type("Flow", (), {"id": uuid.uuid4()})()
@@ -204,7 +220,11 @@ def test_validate_alias_id_preserved():
 
 
 def test_validate_type_action_keeps_text():
-    candidates = [CandidateAction(id="input_0", action_type="type", locator="loc", description="type title")]
+    candidates = [
+        CandidateAction(
+            id="input_0", action_type="type", locator="loc", description="type title", is_form_field=True
+        )
+    ]
     decision = _validate_and_normalize_decision(
         obj={"action_id": "input_0", "action_type": "type", "text_to_type": "Hello"},
         candidates=candidates,
@@ -245,7 +265,11 @@ def test_null_action_id_not_done_returns_fallback():
 
 
 def test_type_missing_text_returns_fallback():
-    candidates = [CandidateAction(id="input_0", action_type="type", locator="loc", description="type title")]
+    candidates = [
+        CandidateAction(
+            id="input_0", action_type="type", locator="loc", description="type title", is_form_field=True
+        )
+    ]
     decision = _validate_and_normalize_decision(
         obj={"action_id": "input_0", "action_type": "type", "text_to_type": "   "},
         candidates=candidates,
@@ -256,6 +280,46 @@ def test_type_missing_text_returns_fallback():
     assert decision.action_id is None
     assert decision.done is True
     assert decision.notes == "fallback_type_missing_text"
+
+
+def test_type_action_rejects_non_form_target():
+    candidates = [
+        CandidateAction(
+            id="btn_0",
+            action_type="click",
+            locator="loc",
+            description="button",
+            is_form_field=False,
+        ),
+        CandidateAction(
+            id="input_0",
+            action_type="type",
+            locator="loc2",
+            description="form field",
+            is_form_field=True,
+        ),
+    ]
+    llm = DummyLLM('{"action_id": "btn_0", "action_type": "type", "text_to_type": "hello"}')
+    task = TaskSpec(original_query="", app_name="linear", goal="enter text", start_url="http://example.com")
+    flow = type("Flow", (), {"id": uuid.uuid4()})()
+    session = DummySession(flow)
+
+    decision = choose_action_with_llm(
+        llm,
+        task,
+        task.app_name,
+        task.start_url,
+        "",
+        candidates,
+        session=session,
+        flow=flow,
+        step_index=1,
+    )
+
+    assert decision.action_id is None
+    assert decision.done is True
+    assert decision.text_to_type is None
+    assert any("policy_invalid_type_target" in log.message for log in session.logs)
 
 
 def test_llm_exception_falls_back():

@@ -293,13 +293,19 @@ async def scan_candidate_actions(
     click_count = await clickable_locator.count()
     for i in range(click_count):
         if len(candidates) >= max_actions:
-            return candidates, [c.id for c in candidates if c.action_type == "type"]
+            return candidates, [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
         handle = clickable_locator.nth(i)
         if not await is_visible(handle):
             continue
 
         tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
-        role = (await handle.get_attribute("role")) or None
+        role_attr = (await handle.get_attribute("role")) or ""
+        contenteditable_attr = await handle.get_attribute("contenteditable")
+
+        if tag_name in {"input", "textarea"} or contenteditable_attr or role_attr.lower() == "textbox":
+            continue
+
+        role = role_attr or None
         aria_label_raw = trim_text(await handle.get_attribute("aria-label"), limit=120)
         labelledby_text = await resolve_labelledby_text(handle)
         aria_label = aria_label_raw or labelledby_text
@@ -359,26 +365,25 @@ async def scan_candidate_actions(
         )
 
     # Discover text entry elements.
-    type_selector = "input, textarea, [contenteditable], [role='textbox']"
+    type_selector = "input, textarea, [contenteditable='true'], [role='textbox']"
     type_locator = page.locator(type_selector)
     type_count = await type_locator.count()
     type_index = 0
     allowed_input_types = {"text", "search", "email", "url", "number", "password"}
     for i in range(type_count):
         if len(candidates) >= max_actions:
-            return candidates, [c.id for c in candidates if c.action_type == "type"]
+            return candidates, [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
         handle = type_locator.nth(i)
         if not await is_visible(handle):
             continue
 
         tag_name = (await handle.evaluate("(el) => el.tagName.toLowerCase()")) or ""
         contenteditable_attr = await handle.get_attribute("contenteditable")
+        input_type = (await handle.get_attribute("type")) or None
         if tag_name == "input":
-            input_type = ((await handle.get_attribute("type")) or "text").lower()
+            input_type = (input_type or "text").lower()
             if input_type not in allowed_input_types:
                 continue
-        else:
-            input_type = (await handle.get_attribute("type")) or None
 
         role = (await handle.get_attribute("role")) or None
         if tag_name not in {"input", "textarea"} and not contenteditable_attr and (role or "").lower() != "textbox":
@@ -412,11 +417,11 @@ async def scan_candidate_actions(
         bbox = await get_bounding_box(handle)
         section_label = infer_section_label(section_chain, bbox)
         visible_text = (
-            trim_text(primary_hint, limit=120)
-            or text_content
-            or aria_label
-            or placeholder_value
-            or ancestor_text
+            trim_text(aria_label_raw, limit=120)
+            or trim_text(label_text, limit=120)
+            or trim_text(placeholder_value, limit=120)
+            or trim_text(text_content, limit=120)
+            or trim_text(ancestor_text, limit=120)
             or ""
         )
 
@@ -433,6 +438,7 @@ async def scan_candidate_actions(
         is_primary_cta, is_nav_link, is_form_field = compute_flags(
             tag_name, role, class_name, section_label, True, semantics
         )
+        is_form_field = True
         goal_match_score = compute_goal_score(f"{visible_text} {ancestor_text}")
 
         element_uid = await get_element_uid(handle)
@@ -480,5 +486,5 @@ async def scan_candidate_actions(
         )
         type_index += 1
 
-    type_ids = [c.id for c in candidates if c.action_type == "type"]
+    type_ids = [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
     return candidates, type_ids

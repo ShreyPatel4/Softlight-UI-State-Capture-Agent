@@ -234,6 +234,51 @@ def test_bans_repeated_failures(monkeypatch):
     assert any("Banned" in log.message for log in session.logs)
 
 
+def test_policy_call_logs_type_ids(monkeypatch):
+    flow = type("Flow", (), {"id": uuid.uuid4(), "cancel_requested": False, "status": "running", "status_reason": None})()
+    session = DummySession(flow)
+    capture_manager = FakeCaptureManager(session)
+    page = FakePage()
+    browser = FakeBrowserSession(page)
+
+    async def fake_scan(_page, max_actions=40, goal=None):  # noqa: ARG001
+        candidates = [
+            CandidateAction(
+                id="btn_0", action_type="click", locator="url_change", description="next"
+            ),
+            CandidateAction(
+                id="input_0",
+                action_type="type",
+                locator="type_input",
+                description="text field",
+                is_form_field=True,
+            ),
+        ]
+        return candidates, [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
+
+    decisions = [make_decision("url_change")]
+
+    def fake_choose(*_args, **_kwargs):  # noqa: ARG001
+        return decisions[0]
+
+    monkeypatch.setattr("src.agent.agent_loop.scan_candidate_actions", fake_scan)
+    monkeypatch.setattr("src.agent.agent_loop.choose_action_with_llm", fake_choose)
+
+    asyncio.run(
+        run_agent_loop(
+            task=type("Task", (), {"goal": "", "app_name": "linear"})(),
+            flow=flow,
+            capture_manager=capture_manager,
+            hf_pipeline=None,
+            start_url=page.url,
+            browser_factory=lambda: browser,
+            max_steps=1,
+        )
+    )
+
+    assert any("type_ids=['input_0']" in log.message for log in session.logs)
+
+
 def test_cancel_request_stops_loop(monkeypatch):
     flow = type("Flow", (), {"id": uuid.uuid4(), "cancel_requested": True, "status": "running", "status_reason": None})()
     session = DummySession(flow)
