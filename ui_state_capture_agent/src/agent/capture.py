@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -9,6 +11,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..models import Flow, Step
 from ..storage.base import StorageBackend
+from .page_snapshot import PageSnapshot
 
 
 class CaptureManager:
@@ -61,6 +64,7 @@ class CaptureManager:
         url_changed: bool,
         state_kind: str,
         description: Optional[str] = None,
+        snapshot: PageSnapshot | None = None,
     ) -> Step:
         step_index = self._next_step_index(flow)
 
@@ -71,6 +75,33 @@ class CaptureManager:
 
         self.storage.save_bytes(screenshot_key, screenshot_bytes)
         self.storage.save_bytes(dom_key, dom_html.encode("utf-8"))
+
+        if snapshot:
+            try:
+                snapshot_payload = {
+                    "dom_nodes": [
+                        {
+                            "index": node.index,
+                            "node_name": node.node_name,
+                            "attributes": node.attributes,
+                            "text_snippet": node.text_snippet,
+                        }
+                        for node in snapshot.dom_nodes
+                    ],
+                    "ax_nodes": [
+                        {
+                            "node_id": ax.node_id,
+                            "role": ax.role,
+                            "name": ax.name,
+                            "dom_node_indices": ax.dom_node_indices,
+                        }
+                        for ax in snapshot.ax_nodes
+                    ],
+                }
+                snapshot_key = f"{flow.prefix}/snapshots/step_{step_index:03d}_ax.json"
+                self.storage.save_bytes(snapshot_key, json.dumps(snapshot_payload).encode("utf-8"))
+            except Exception as exc:
+                logging.warning("snapshot_persist_failed step=%s reason=%s", step_index, exc)
 
         step = Step(
             flow_id=flow.id,

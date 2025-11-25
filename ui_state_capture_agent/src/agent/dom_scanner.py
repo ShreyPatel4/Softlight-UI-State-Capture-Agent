@@ -1,10 +1,13 @@
 from __future__ import annotations
 """Generic DOM scanner for interactive elements (no app-specific selectors)."""
 
+import logging
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Set, Tuple
 
 from playwright.async_api import Page
+
+from .page_snapshot import AXNode, PageSnapshot, SnapshotNode
 
 ActionType = Literal["click", "type"]
 
@@ -31,6 +34,7 @@ class CandidateAction:
     is_nav_link: bool = False
     is_form_field: bool = False
     goal_match_score: float = 0.0
+    source_hint: Optional[str] = None
 
     def __post_init__(self) -> None:
         # Preserve backward compatibility by mirroring the action_type in kind and
@@ -43,23 +47,163 @@ class CandidateAction:
             self.semantics = set(self.semantics)
 
 
-# This scanner tries to build a generic catalogue of interactive elements on the
-# page, similar in spirit to a HAR/trace, but focused on click and text entry
-# actions. It must remain generic with no app-specific selectors or workflows.
-async def scan_candidate_actions(
-    page: Page, max_actions: int = 60, goal: Optional[str] = None
-) -> tuple[List[CandidateAction], List[str]]:
-    """
-    Build a HAR-like catalogue of visible interactive elements, identifying both
-    click targets and text entry fields using only generic DOM attributes.
-    """
-    candidates: List[CandidateAction] = []
+def _prepare_goal_tokens(goal: Optional[str]) -> Set[str]:
     goal_tokens: Set[str] = set()
     if goal:
         for token in goal.lower().split():
             cleaned = "".join(ch for ch in token if ch.isalnum() or ch in {"-", "_"})
             if len(cleaned) >= 3:
                 goal_tokens.add(cleaned)
+    return goal_tokens
+
+
+def _compute_goal_score(candidate_text: str, goal_tokens: Set[str]) -> float:
+    if not goal_tokens:
+        return 0.0
+    lowered = candidate_text.lower()
+    return float(sum(1 for tok in goal_tokens if tok in lowered))
+
+
+def _snapshot_text_from_dom_indices(dom_indices: List[int], by_dom_index: dict[int, SnapshotNode]) -> str:
+    parts: list[str] = []
+    for idx in dom_indices:
+        node = by_dom_index.get(idx)
+        if not node:
+            continue
+        if node.text_snippet:
+            parts.append(node.text_snippet)
+        if node.attributes:
+            for key in ["aria-label", "placeholder", "alt", "title"]:
+                if key in node.attributes and node.attributes[key]:
+                    parts.append(node.attributes[key])
+    return " ".join(part for part in parts if part).strip()
+
+
+def _scan_click_candidates_from_snapshot(snapshot: PageSnapshot, goal_tokens: Set[str]) -> List[CandidateAction]:
+    candidates: List[CandidateAction] = []
+    control_roles = {"button", "link", "menuitem", "tab", "checkbox", "radio", "switch"}
+    for i, ax in enumerate(snapshot.ax_nodes):
+        role = (ax.role or "").lower()
+        if role not in control_roles:
+            continue
+        label_parts = [ax.name or ""]
+        label_parts.append(_snapshot_text_from_dom_indices(ax.dom_node_indices, snapshot.by_dom_index))
+        label = next((part.strip() for part in label_parts if part and part.strip()), "")
+        locator = f"text={label}" if label else "css=*"
+        visible_text = label or role
+        goal_match_score = _compute_goal_score(visible_text, goal_tokens)
+        is_primary_cta = role == "button" and any(
+            keyword in visible_text.lower() for keyword in ["submit", "confirm", "save", "next"]
+        )
+        is_nav_link = role == "link"
+        candidates.append(
+            CandidateAction(
+                id=f"ax_btn_{i}",
+                locator=locator,
+                action_type="click",
+                description=visible_text or role or "click",
+                role=role,
+                visible_text=visible_text,
+                is_primary_cta=is_primary_cta,
+                is_nav_link=is_nav_link,
+                goal_match_score=goal_match_score,
+                semantics={"ax"},
+                tag=None,
+                aria_label=ax.name,
+                text=visible_text,
+                source_hint="ax_snapshot",
+            )
+        )
+    return candidates
+
+
+def _is_dom_text_input(node: SnapshotNode) -> bool:
+    node_name = (node.node_name or "").lower()
+    if node_name in {"input", "textarea"}:
+        return True
+    if node.attributes.get("contenteditable", "").lower() == "true":
+        return True
+    return False
+
+
+def _scan_text_candidates_from_snapshot(snapshot: PageSnapshot, goal_tokens: Set[str]) -> List[CandidateAction]:
+    candidates: List[CandidateAction] = []
+    text_roles = {"textbox", "searchbox", "combobox"}
+
+    for i, ax in enumerate(snapshot.ax_nodes):
+        role = (ax.role or "").lower()
+        if role not in text_roles:
+            continue
+        label = ax.name or _snapshot_text_from_dom_indices(ax.dom_node_indices, snapshot.by_dom_index)
+        label = label.strip() if label else ""
+        locator = f"text={label}" if label else "css=input,textarea"
+        visible_text = label or role or "input"
+        goal_match_score = _compute_goal_score(visible_text, goal_tokens)
+        candidates.append(
+            CandidateAction(
+                id=f"ax_input_{i}",
+                locator=locator,
+                action_type="type",
+                description=visible_text or "text entry",
+                role=role,
+                visible_text=visible_text,
+                placeholder=None,
+                is_form_field=True,
+                goal_match_score=goal_match_score,
+                semantics={"ax"},
+                aria_label=ax.name,
+                source_hint="ax_snapshot",
+            )
+        )
+
+    dom_inputs = [node for node in snapshot.dom_nodes if _is_dom_text_input(node)]
+    for j, node in enumerate(dom_inputs):
+        label = node.attributes.get("aria-label") or node.attributes.get("placeholder") or node.text_snippet or ""
+        label = label.strip()
+        locator = f"text={label}" if label else "css=input,textarea"
+        goal_match_score = _compute_goal_score(label or node.node_name, goal_tokens)
+        candidates.append(
+            CandidateAction(
+                id=f"dom_input_{j}",
+                locator=locator,
+                action_type="type",
+                description=label or f"{node.node_name} field",
+                tag=node.node_name,
+                visible_text=label or node.node_name,
+                placeholder=node.attributes.get("placeholder"),
+                is_form_field=True,
+                goal_match_score=goal_match_score,
+                semantics={"dom_snapshot"},
+                source_hint="dom_snapshot",
+            )
+        )
+
+    return candidates
+
+
+# This scanner tries to build a generic catalogue of interactive elements on the
+# page, similar in spirit to a HAR/trace, but focused on click and text entry
+# actions. It must remain generic with no app-specific selectors or workflows.
+async def scan_candidate_actions(
+    page: Page,
+    max_actions: int = 60,
+    goal: Optional[str] = None,
+    snapshot: PageSnapshot | None = None,
+    step_index: int | None = None,
+) -> tuple[List[CandidateAction], List[str]]:
+    """
+    Build a HAR-like catalogue of visible interactive elements, identifying both
+    click targets and text entry fields using only generic DOM attributes.
+    """
+    candidates: List[CandidateAction] = []
+    candidate_ids: Set[str] = set()
+    goal_tokens: Set[str] = _prepare_goal_tokens(goal)
+
+    def add_candidate(cand: CandidateAction) -> None:
+        if cand.id in candidate_ids or len(candidates) >= max_actions:
+            return
+        candidates.append(cand)
+        candidate_ids.add(cand.id)
 
     viewport_width = 0.0
     viewport_height = 0.0
@@ -280,10 +424,30 @@ async def scan_candidate_actions(
         return is_primary_cta, is_nav_link, is_form_field
 
     def compute_goal_score(candidate_text: str) -> float:
-        if not goal_tokens:
-            return 0.0
-        lowered = candidate_text.lower()
-        return float(sum(1 for tok in goal_tokens if tok in lowered))
+        return _compute_goal_score(candidate_text, goal_tokens)
+
+    snapshot_click_candidates: List[CandidateAction] = []
+    snapshot_text_candidates: List[CandidateAction] = []
+    if snapshot:
+        snapshot_click_candidates = _scan_click_candidates_from_snapshot(snapshot, goal_tokens)
+        snapshot_text_candidates = _scan_text_candidates_from_snapshot(snapshot, goal_tokens)
+        if snapshot_text_candidates:
+            examples = [
+                {
+                    "id": cand.id,
+                    "role": cand.role,
+                    "visible_text": (cand.visible_text or "")[:60],
+                }
+                for cand in snapshot_text_candidates[:3]
+            ]
+            logging.debug(
+                "text_candidates_from_snapshot step=%s count=%s examples=%s",
+                step_index,
+                len(snapshot_text_candidates),
+                examples,
+            )
+        for cand in snapshot_click_candidates:
+            add_candidate(cand)
 
     seen_elements: Set[str] = set()
 
@@ -339,7 +503,7 @@ async def scan_candidate_actions(
         if element_uid:
             seen_elements.add(element_uid)
 
-        candidates.append(
+        add_candidate(
             CandidateAction(
                 id=f"btn_{i}" if tag_name != "a" else f"link_{i}",
                 locator=f"{clickable_selector} >> nth={i}",
@@ -365,6 +529,12 @@ async def scan_candidate_actions(
         )
 
     # Discover text entry elements.
+    if snapshot_text_candidates:
+        for cand in snapshot_text_candidates:
+            add_candidate(cand)
+        type_ids = [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
+        return candidates, type_ids
+
     type_selector = "input, textarea, [contenteditable='true'], [role='textbox']"
     type_locator = page.locator(type_selector)
     type_count = await type_locator.count()
@@ -460,7 +630,7 @@ async def scan_candidate_actions(
         description = (
             f"{base_desc} \"{desc_hint}\"" if desc_hint else base_desc
         )
-        candidates.append(
+        add_candidate(
             CandidateAction(
                 id=f"input_{type_index}",
                 locator=f"{type_selector} >> nth={i}",

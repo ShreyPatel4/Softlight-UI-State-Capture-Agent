@@ -55,6 +55,7 @@ class FakeCaptureManager:
         state_kind,
         description=None,
         step_index=None,
+        snapshot=None,
     ):
         idx = step_index or len(self.steps) + 1
         step = {
@@ -143,6 +144,9 @@ class FakeBrowserSession:
     async def goto(self, url: str, wait_ms: int = 1500):
         self.page.url = url
 
+    async def capture_page_snapshot(self):
+        return None
+
 
 def make_decision(action_id: str, text: str | None = None) -> PolicyDecision:
     return PolicyDecision(
@@ -167,7 +171,7 @@ def test_respects_max_steps(monkeypatch):
 
     decisions = [make_decision("url_change"), make_decision("url_change")]
 
-    async def fake_scan(_page, max_actions=40, goal=None):
+    async def fake_scan(_page, max_actions=40, goal=None, snapshot=None, step_index=None):
         candidates = [
             CandidateAction(
                 id="url_change", action_type="click", locator="url_change", description="button change"
@@ -206,7 +210,7 @@ def test_bans_repeated_failures(monkeypatch):
 
     decisions = [make_decision("no_change") for _ in range(3)]
 
-    async def fake_scan(_page, max_actions=40, goal=None):
+    async def fake_scan(_page, max_actions=40, goal=None, snapshot=None, step_index=None):
         candidates = [
             CandidateAction(id="no_change", action_type="click", locator="no_change", description="no change")
         ]
@@ -241,7 +245,7 @@ def test_policy_call_logs_type_ids(monkeypatch):
     page = FakePage()
     browser = FakeBrowserSession(page)
 
-    async def fake_scan(_page, max_actions=40, goal=None):  # noqa: ARG001
+    async def fake_scan(_page, max_actions=40, goal=None, snapshot=None, step_index=None):  # noqa: ARG001
         candidates = [
             CandidateAction(
                 id="btn_0", action_type="click", locator="url_change", description="next"
@@ -286,7 +290,7 @@ def test_cancel_request_stops_loop(monkeypatch):
     page = FakePage()
     browser = FakeBrowserSession(page)
 
-    async def fake_scan(_page, max_actions=40, goal=None):
+    async def fake_scan(_page, max_actions=40, goal=None, snapshot=None, step_index=None):
         candidates = [
             CandidateAction(
                 id="url_change", action_type="click", locator="url_change", description="button change"
@@ -334,7 +338,7 @@ def test_steps_record_url_and_state(monkeypatch):
         ),
     ]
 
-    async def fake_scan(_page, max_actions=40, goal=None):
+    async def fake_scan(_page, max_actions=40, goal=None, snapshot=None, step_index=None):
         candidates = [
             CandidateAction(id="url_change", action_type="click", locator="url_change", description="button change"),
             CandidateAction(id="url_change2", action_type="click", locator="url_change2", description="finish"),
@@ -386,7 +390,7 @@ def test_type_action_executes_and_finishes(monkeypatch):
     ]
     call_count = {"count": 0}
 
-    async def fake_scan(_page, max_actions=40, goal=None):  # noqa: ARG001
+    async def fake_scan(_page, max_actions=40, goal=None, snapshot=None, step_index=None):  # noqa: ARG001
         candidates = [
             CandidateAction(
                 id="input_0", action_type="type", locator="type_input", description="Text input labeled 'Title'"
@@ -441,7 +445,7 @@ def test_missing_type_target_sets_fallback(monkeypatch):
         )
     ]
 
-    async def fake_scan(_page, max_actions=40, goal=None):  # noqa: ARG001
+    async def fake_scan(_page, max_actions=40, goal=None, snapshot=None, step_index=None):  # noqa: ARG001
         candidates = [
             CandidateAction(id="input_0", action_type="type", locator="missing", description="Missing input"),
         ]
@@ -490,7 +494,7 @@ def test_done_without_change_marks_uncertain(monkeypatch):
         )
     ]
 
-    async def fake_scan(_page, max_actions=40, goal=None):
+    async def fake_scan(_page, max_actions=40, goal=None, snapshot=None, step_index=None):
         candidates = [CandidateAction(id="no_change", action_type="click", locator="no_change", description="noop")]
         return candidates, [c.id for c in candidates if c.action_type == "type"]
 
@@ -537,7 +541,7 @@ def test_capture_goal_can_finish_after_initial(monkeypatch):
         )
     ]
 
-    async def fake_scan(_page, max_actions=40, goal=None):
+    async def fake_scan(_page, max_actions=40, goal=None, snapshot=None, step_index=None):
         candidates = [CandidateAction(id="no_change", action_type="click", locator="no_change", description="noop")]
         return candidates, [c.id for c in candidates if c.action_type == "type"]
 
@@ -584,7 +588,7 @@ def test_llm_fallback_still_captures(monkeypatch):
         )
     ]
 
-    async def fake_scan(_page, max_actions=40, goal=None):
+    async def fake_scan(_page, max_actions=40, goal=None, snapshot=None, step_index=None):
         candidates = [
             CandidateAction(
                 id="url_change", action_type="click", locator="url_change", description="button change"

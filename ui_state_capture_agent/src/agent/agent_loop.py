@@ -49,6 +49,7 @@ async def _maybe_capture_state(
     last_captured_url: str | None,
     diff_threshold: float,
     force: bool = False,
+    snapshot=None,
 ):
     url_changed, diff_summary, diff_score, state_kind, changed = summarize_state_change(
         last_captured_dom, current_dom, last_captured_url, page.url, diff_threshold
@@ -68,6 +69,7 @@ async def _maybe_capture_state(
         action_description=description,
         url_changed=url_changed,
         state_kind=state_kind,
+        snapshot=snapshot,
     )
     return step, current_dom, page.url, changed, state_kind, diff_score
 
@@ -101,6 +103,15 @@ async def run_agent_loop(
         if page is None:
             return
 
+        snapshot = await browser.capture_page_snapshot()
+        if snapshot:
+            log_flow_event(
+                session,
+                flow,
+                "debug",
+                f"snapshot_summary step=0 dom_nodes={len(snapshot.dom_nodes)} ax_nodes={len(snapshot.ax_nodes)}",
+            )
+
         dom_html = await capture_manager.get_dom_snapshot(page)
         prev_url = page.url
         prev_dom = dom_html
@@ -117,13 +128,17 @@ async def run_agent_loop(
             action_description="initial page load",
             url_changed=True,
             state_kind="url_change",
+            snapshot=snapshot,
         )
 
         log_flow_event(session, flow, "info", "Captured initial_state")
 
-        candidates, type_ids = await scan_candidate_actions(page, max_actions=40, goal=task.goal)
+        candidates, type_ids = await scan_candidate_actions(
+            page, max_actions=40, goal=task.goal, snapshot=snapshot, step_index=0
+        )
         candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
         type_ids = [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
+        active_snapshot = snapshot
         if not candidates:
             flow.status = "no_actions"
             flow.status_reason = "no_candidates"
@@ -148,7 +163,25 @@ async def run_agent_loop(
                 return
 
             if step_index != 1:
-                candidates, type_ids = await scan_candidate_actions(page, max_actions=40, goal=task.goal)
+                active_snapshot = await browser.capture_page_snapshot()
+                if active_snapshot:
+                    log_flow_event(
+                        session,
+                        flow,
+                        "debug",
+                        "snapshot_summary step={step} dom_nodes={dom} ax_nodes={ax}".format(
+                            step=step_index,
+                            dom=len(active_snapshot.dom_nodes),
+                            ax=len(active_snapshot.ax_nodes),
+                        ),
+                    )
+                candidates, type_ids = await scan_candidate_actions(
+                    page,
+                    max_actions=40,
+                    goal=task.goal,
+                    snapshot=active_snapshot,
+                    step_index=step_index,
+                )
                 candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
                 type_ids = [c.id for c in candidates if c.is_form_field or c.action_type == "type"]
 
@@ -177,6 +210,17 @@ async def run_agent_loop(
                     f"id={cand.id} kind={kind} text=\"{text_preview}\" score={cand.goal_match_score:.2f}"
                 )
             summary_text = "; ".join(summaries)
+            if active_snapshot:
+                log_flow_event(
+                    session,
+                    flow,
+                    "debug",
+                    "snapshot_summary step={step} dom_nodes={dom} ax_nodes={ax}".format(
+                        step=step_index,
+                        dom=len(active_snapshot.dom_nodes),
+                        ax=len(active_snapshot.ax_nodes),
+                    ),
+                )
             log_flow_event(
                 session,
                 flow,
@@ -203,6 +247,7 @@ async def run_agent_loop(
 
             if decision.action_id is None:
                 if decision.capture:
+                    fallback_snapshot = await browser.capture_page_snapshot()
                     await _maybe_capture_state(
                         capture_manager,
                         page,
@@ -214,6 +259,7 @@ async def run_agent_loop(
                         last_captured_url,
                         diff_threshold,
                         force=True,
+                        snapshot=fallback_snapshot,
                     )
                 flow.status = "finished"
                 flow.status_reason = "llm_fallback"
@@ -254,6 +300,7 @@ async def run_agent_loop(
                             "warning",
                             f"Target for {selected_candidate.id} missing; ending with fallback",
                         )
+                        missing_snapshot = await browser.capture_page_snapshot()
                         await _maybe_capture_state(
                             capture_manager,
                             page,
@@ -265,6 +312,7 @@ async def run_agent_loop(
                             last_captured_url,
                             diff_threshold,
                             force=True,
+                            snapshot=missing_snapshot,
                         )
                         flow.status = "finished"
                         flow.status_reason = "type_target_missing"
@@ -453,6 +501,7 @@ async def run_agent_loop(
                 break
 
             should_force_capture = bool(decision.capture or decision.done)
+            post_action_snapshot = await browser.capture_page_snapshot()
             step, last_captured_dom, last_captured_url, captured_changed, captured_state_kind, captured_diff = await _maybe_capture_state(
                 capture_manager,
                 page,
@@ -464,6 +513,7 @@ async def run_agent_loop(
                 last_captured_url,
                 diff_threshold,
                 force=should_force_capture,
+                snapshot=post_action_snapshot,
             )
             if step:
                 log_flow_event(
