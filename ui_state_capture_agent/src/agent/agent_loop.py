@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
+from dataclasses import asdict
 from datetime import datetime, timezone
 import logging
-from typing import Callable
+from typing import Any, Callable
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from sqlalchemy.orm import Session
@@ -13,7 +14,7 @@ from ..models import Flow, log_flow_event
 from .browser import BrowserSession
 from .capture import CaptureManager
 from .dom_scanner import CandidateAction, scan_candidate_actions
-from .policy import PolicyLLMClient, PolicyDecision, choose_action_with_llm
+from .policy import PolicyInput, PolicyLLMClient, PolicyDecision, choose_action_with_llm
 from .state_diff import summarize_state_change
 from .task_spec import TaskSpec
 
@@ -162,6 +163,7 @@ async def run_agent_loop(
     last_action_id: str | None = None
     repeated_no_progress_count = 0
     STUCK_NO_PROGRESS_THRESHOLD = 3
+    recent_events: deque[dict[str, Any]] = deque(maxlen=5)
 
     async with browser_factory() as browser:
         await browser.goto(start_url)
@@ -205,7 +207,7 @@ async def run_agent_loop(
             page, max_actions=40, goal=task.goal, snapshot=snapshot, step_index=0
         )
         candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
-        type_ids = [c.id for c in candidates if c.is_type_target]
+        type_ids = type_ids or [c.id for c in candidates if c.is_type_target]
         logging.debug(
             "agent_loop step=%s url=%s candidate_count=%s type_ids_sample=%s",
             0,
@@ -259,7 +261,7 @@ async def run_agent_loop(
                     step_index=step_index,
                 )
                 candidates = [c for c in candidates if _candidate_key(c) not in banned_actions]
-                type_ids = [c.id for c in candidates if c.is_type_target]
+                type_ids = type_ids or [c.id for c in candidates if c.is_type_target]
                 logging.debug(
                     "agent_loop step=%s url=%s candidate_count=%s type_ids_sample=%s",
                     step_index,
@@ -332,6 +334,21 @@ async def run_agent_loop(
                     summary=summary_text,
                 ),
             )
+            candidate_payloads: list[dict[str, Any]] = []
+            for cand in candidates:
+                payload_cand = asdict(cand)
+                if isinstance(payload_cand.get("semantics"), set):
+                    payload_cand["semantics"] = sorted(list(payload_cand["semantics"]))
+                candidate_payloads.append(payload_cand)
+            policy_input = PolicyInput(
+                goal=task.goal,
+                url=current_url,
+                candidates=candidate_payloads,
+                type_ids=type_ids,
+                step_index=step_index,
+                banned_action_ids=sorted(list(banned_actions)) if banned_actions else None,
+                recent_events=list(recent_events),
+            )
             decision: PolicyDecision = choose_action_with_llm(
                 llm_client,
                 task,
@@ -343,6 +360,8 @@ async def run_agent_loop(
                 session=session,
                 flow=flow,
                 step_index=step_index,
+                banned_action_ids=policy_input.banned_action_ids,
+                recent_events=policy_input.recent_events,
             )
 
             decision = maybe_promote_primary_cta(
@@ -388,6 +407,7 @@ async def run_agent_loop(
                 action_description = f"{selected_candidate.description}: \"{preview_text}\""
 
             locator = page.locator(selected_candidate.locator)
+            timed_out = False
             try:
                 if decision.action_type == "click":
                     if not await locator.is_visible():
@@ -467,6 +487,16 @@ async def run_agent_loop(
                                 "warning",
                                 f"Banned {selected_candidate.id} after repeated timeouts",
                             )
+                        recent_events.append(
+                            {
+                                "step_index": step_index,
+                                "action_id": decision.action_id,
+                                "action_type": decision.action_type,
+                                "effect_kind": "timeout",
+                                "outcome": "timeout",
+                                "comment": "Action timed out",
+                            }
+                        )
                         continue
                     try:
                         await locator.fill(typed_value, timeout=4000)
@@ -513,6 +543,16 @@ async def run_agent_loop(
                                     f"Banned {selected_candidate.id} after repeated timeouts",
                                 )
                             type_failed = True
+                            recent_events.append(
+                                {
+                                    "step_index": step_index,
+                                    "action_id": decision.action_id,
+                                    "action_type": decision.action_type,
+                                    "effect_kind": "timeout",
+                                    "outcome": "timeout",
+                                    "comment": "Action timed out",
+                                }
+                            )
                             continue
                         except Exception as exc:
                             log_flow_event(
@@ -546,6 +586,16 @@ async def run_agent_loop(
                 if failure_counts[key] > max_action_failures:
                     banned_actions.add(key)
                     log_flow_event(session, flow, "warning", f"Banned {selected_candidate.id} after repeated timeouts")
+                recent_events.append(
+                    {
+                        "step_index": step_index,
+                        "action_id": decision.action_id,
+                        "action_type": decision.action_type,
+                        "effect_kind": "timeout",
+                        "outcome": "timeout",
+                        "comment": "Action timed out",
+                    }
+                )
                 continue
             except Exception as exc:
                 key = _candidate_key(selected_candidate)
@@ -642,6 +692,37 @@ async def run_agent_loop(
                     "info",
                     f"step={step_index} url={current_url} action='{action_description}' diff={captured_diff} captured=True",
                 )
+
+            effect_kind = captured_state_kind or state_kind or ("url_change" if url_changed else "no_change")
+            dom_diff_score = diff_score
+            if timed_out:
+                outcome = "timeout"
+            elif dom_diff_score is None:
+                outcome = "unknown"
+            elif dom_diff_score > diff_threshold:
+                outcome = "progress"
+            else:
+                outcome = "no_effect"
+
+            if outcome == "progress":
+                comment_string = "Click produced large DOM change (likely new view or dialog)"
+            elif outcome == "no_effect":
+                comment_string = "Click produced almost no visible change"
+            elif outcome == "timeout":
+                comment_string = "Action timed out"
+            else:
+                comment_string = "Change impact uncertain"
+
+            recent_events.append(
+                {
+                    "step_index": step_index,
+                    "action_id": decision.action_id,
+                    "action_type": decision.action_type,
+                    "effect_kind": effect_kind,
+                    "outcome": outcome,
+                    "comment": comment_string,
+                }
+            )
 
             summary_line = f"{step_index}. {action_description}".strip()
             history_summary = "\n".join([line for line in [history_summary, summary_line] if line])

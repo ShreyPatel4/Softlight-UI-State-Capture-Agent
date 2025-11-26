@@ -28,6 +28,33 @@ class PolicyDecision:
     should_capture: bool = True
 
 
+@dataclass
+class PolicyInput:
+    goal: str
+    url: str
+    candidates: list[dict[str, Any]]
+    type_ids: list[str]
+    step_index: int | None = None
+    # new fields
+    banned_action_ids: list[str] | None = None
+    recent_events: list[dict[str, Any]] | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = {
+            "goal": self.goal,
+            "url": self.url,
+            "candidates": self.candidates,
+            "type_ids": self.type_ids,
+        }
+        if self.step_index is not None:
+            payload["step_index"] = self.step_index
+        if self.banned_action_ids:
+            payload["banned_action_ids"] = self.banned_action_ids
+        if self.recent_events:
+            payload["recent_events"] = self.recent_events
+        return payload
+
+
 POLICY_SYSTEM_PROMPT = """
 You are a deterministic UI policy that selects exactly one action for the next step on the current page.
 
@@ -63,6 +90,16 @@ Decision rules for create or new flows:
    * After you have filled the most relevant name or title field, your next step should usually be a primary call to action such as "Create project", "Create issue", "Save", or similar that completes the task, rather than typing the same text into more and more fields.
 
    * Avoid repeating the same type action that does not produce a new effect. If the last action already set the correct text and you see the same state again, choose a different action that moves the flow forward, usually a primary call to action.
+
+You are also given:
+- banned_action_ids: a list of action ids that recently failed or timed out and should be treated as very low priority.
+- recent_events: a short history of the last steps, each including step_index, action_id, action_type, effect_kind, outcome, and a brief comment.
+
+Use these signals as follows:
+- If an action_id appears in banned_action_ids, you must not choose it again.
+- If recent_events show that clicking the same action_id produced "no_effect" or repeated very small changes several times in a row, strongly prefer any other candidate that can move the task forward.
+- If a recent event with outcome "progress" or effect_kind such as "url_change" or "dom_change_modal" already opened a new view, dialog, or page, avoid clicking that same control again in the very next steps. Instead, look for the next logical action in that new context, such as typing into a relevant text field, using a search or AI tool that matches the goal, or clicking a primary confirmation or create button.
+- Do not loop on navigation actions like "New page", "Add page", or similar if they are not changing the visible state any more. Once you have opened the new page or item, move on to naming it or completing the requested operation from the goal.
 
 Decision rules for filter or search flows:
 
@@ -136,6 +173,8 @@ def build_policy_prompt(
     history_summary: str,
     candidates: Sequence[CandidateAction],
     type_ids: Sequence[str] | None = None,
+    banned_action_ids: Sequence[str] | None = None,
+    recent_events: Sequence[dict[str, Any]] | None = None,
 ) -> str:
     type_ids = list(type_ids) if type_ids is not None else [
         c.id for c in candidates if c.is_form_field or c.action_type == "type"
@@ -177,6 +216,23 @@ def build_policy_prompt(
     lines.append("")
     lines.append("History summary:")
     lines.append(history_summary if history_summary else "(no previous actions)")
+    if banned_action_ids:
+        lines.append("")
+        lines.append(f"Banned action_ids (avoid): {list(banned_action_ids)}")
+    if recent_events:
+        lines.append("")
+        lines.append("Recent events (most recent last):")
+        for ev in recent_events:
+            lines.append(
+                "  - step={step} action_id={aid} type={atype} effect={effect} outcome={outcome} comment={comment}".format(
+                    step=ev.get("step_index"),
+                    aid=ev.get("action_id"),
+                    atype=ev.get("action_type"),
+                    effect=ev.get("effect_kind"),
+                    outcome=ev.get("outcome"),
+                    comment=ev.get("comment", ""),
+                )
+            )
     lines.append("")
     lines.append("Candidate actions (id, kind, text, section, scoring):")
     if candidates:
@@ -401,8 +457,19 @@ def choose_action_with_llm(
     session: Session | None = None,
     flow: Flow | None = None,
     step_index: int | None = None,
+    banned_action_ids: Sequence[str] | None = None,
+    recent_events: Sequence[dict[str, Any]] | None = None,
 ) -> PolicyDecision:
-    prompt = build_policy_prompt(task, app_name, url, history_summary, candidates, type_ids)
+    prompt = build_policy_prompt(
+        task,
+        app_name,
+        url,
+        history_summary,
+        candidates,
+        type_ids,
+        banned_action_ids,
+        recent_events,
+    )
     try:
         raw = llm.generate_text(prompt)
     except Exception as exc:  # noqa: BLE001
@@ -498,6 +565,8 @@ class Policy:
         history_summary: str,
         url: str,
         type_ids: Sequence[str] | None = None,
+        banned_action_ids: Sequence[str] | None = None,
+        recent_events: Sequence[dict[str, Any]] | None = None,
     ) -> PolicyDecision:
         prompt = build_policy_prompt(
             task=task,
@@ -506,6 +575,8 @@ class Policy:
             history_summary=history_summary,
             candidates=candidates,
             type_ids=type_ids,
+            banned_action_ids=banned_action_ids,
+            recent_events=recent_events,
         )
         raw = self._run_hf(prompt)
         parsed, reason = _extract_json(raw)
