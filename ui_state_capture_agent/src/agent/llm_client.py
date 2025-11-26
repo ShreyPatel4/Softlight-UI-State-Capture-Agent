@@ -5,10 +5,26 @@ import json
 import re
 from typing import Any, Optional
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from openai import OpenAI
 
 from ..config import settings
 
+
+class OpenAIChatPipeline:
+    def __init__(self, model: str, api_key: str, base_url: str | None, max_new_tokens: int):
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.model = model
+        self.max_new_tokens = max_new_tokens
+
+    def __call__(self, prompt, max_new_tokens: int | None = None, **_):
+        max_tokens = max_new_tokens or self.max_new_tokens
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=max_tokens,
+        )
+        return [{"generated_text": resp.choices[0].message.content}]
 
 def _extract_json_object(text: str) -> Optional[dict]:
     """Extract the last JSON object from the provided text.
@@ -95,20 +111,17 @@ class PolicyLLMClient:
         return str(out).strip()
 
 
-def create_text_generation_pipeline(model_name: str | None = None, *, max_new_tokens: int = 512) -> Any:
-    model_name = model_name or settings.hf_model_name
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-
-    return pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        device="cpu",
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-    )
-
+def create_text_generation_pipeline(model_name: str | None = None, *, max_new_tokens: int = 512):
+    if settings.llm_provider == "openai":
+        if not settings.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required when llm_provider=openai")
+        return OpenAIChatPipeline(
+            model=model_name or settings.openai_model,
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url,
+            max_new_tokens=max_new_tokens,
+        )
+    raise ValueError(f"Unsupported llm_provider: {settings.llm_provider}")
 
 def create_structured_llm_client(model_name: str | None = None, *, max_new_tokens: int = 512) -> StructuredLLMClient:
     return StructuredLLMClient(

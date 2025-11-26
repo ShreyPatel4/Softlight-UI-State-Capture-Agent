@@ -6,12 +6,10 @@ from dataclasses import dataclass
 from typing import Any, Literal, Optional, Sequence
 
 from sqlalchemy.orm import Session
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-
+from .llm_client import PolicyLLMClient, create_text_generation_pipeline
 from ..config import settings
 from ..models import Flow, log_flow_event
 from .dom_scanner import CandidateAction
-from .llm_client import PolicyLLMClient
 from .task_spec import TaskSpec
 
 
@@ -203,19 +201,7 @@ def _best_click_candidate(candidates: Sequence[CandidateAction]) -> CandidateAct
 
 
 def create_policy_hf_pipeline(model_name: str | None = None) -> Any:
-    model_name = model_name or settings.hf_model_name
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-
-    return pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        device="cpu",
-        max_new_tokens=128,
-        do_sample=False,
-    )
-
+    return create_text_generation_pipeline(model_name=model_name, max_new_tokens=128)
 
 def _validate_and_normalize_decision(
     *,
@@ -427,8 +413,8 @@ class Policy:
     """LLM backed policy that chooses the next UI action."""
 
     def __init__(self, model_name: str | None = None) -> None:
-        model_name = model_name or settings.hf_model_name
-        self.generator = create_policy_hf_pipeline(model_name)
+        default_model = model_name or settings.openai_model
+        self.generator = create_policy_hf_pipeline(default_model)
 
     def _run_hf(self, prompt: str) -> str:
         out = self.generator(

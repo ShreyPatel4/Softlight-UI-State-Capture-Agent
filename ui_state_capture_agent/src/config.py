@@ -14,7 +14,10 @@ class Settings(BaseSettings):
     minio_access_key: str | None = None
     minio_secret_key: str | None = None
     minio_bucket: str = "ui-state-capture"
-    llm_provider: str = "huggingface"
+    llm_provider: str = "openai"
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
+    openai_base_url: str | None = None
     hf_model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
     transformers_cache: str | None = None
     hf_home: str | None = None
@@ -23,6 +26,7 @@ class Settings(BaseSettings):
     dom_diff_threshold: float = 0.05
     max_action_failures: int = 2
 
+    
 def get_settings() -> Settings:
     return Settings()
 
